@@ -20177,8 +20177,8 @@ async fn reasoning_only_forever_is_bounded_then_fails() {
 
     assert_eq!(
         model.calls.load(std::sync::atomic::Ordering::SeqCst),
-        1 + super::MAX_REASONING_ONLY_REPROMPTS as usize,
-        "reasoning-only retries are bounded by MAX_REASONING_ONLY_REPROMPTS"
+        1 + crate::config::DEFAULT_REASONING_ONLY_REPROMPTS as usize,
+        "reasoning-only retries are bounded by DEFAULT_REASONING_ONLY_REPROMPTS"
     );
     let status = events
         .iter()
