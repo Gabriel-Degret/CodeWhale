@@ -2338,25 +2338,25 @@ impl Engine {
 
                     // If a custom reprompt message is configured, insert it as
                     // a runtime-generated user message to nudge the model.
-                    if let Some(ref msg) = self.config.reasoning_only_reprompt_message {
-                        if !msg.is_empty() {
-                            let reprompt = self.runtime_text_message_with_turn_metadata(
-                                msg.clone(),
-                                UserInputProvenance::Runtime,
-                            );
-                            self.add_session_message(reprompt).await;
-                            let _ = self
-                                .tx_event
-                                .send(Event::status(format!(
-                                    "Model returned only reasoning; sending reprompt message ({attempt}/{max_reprompts})"
-                                )))
-                                .await;
-                            crate::logging::warn(format!(
-                                "Model returned only reasoning with no answer or tool call (attempt {attempt}/{max_reprompts}); sending reprompt message"
-                            ));
-                            turn_error = None;
-                            continue;
-                        }
+                    if let Some(ref msg) = self.config.reasoning_only_reprompt_message
+                        && !msg.is_empty()
+                    {
+                        let reprompt = self.runtime_text_message_with_turn_metadata(
+                            msg.clone(),
+                            UserInputProvenance::Runtime,
+                        );
+                        self.add_session_message(reprompt).await;
+                        let _ = self
+                            .tx_event
+                            .send(Event::status(format!(
+                                "Model returned only reasoning; sending reprompt message ({attempt}/{max_reprompts})"
+                            )))
+                            .await;
+                        crate::logging::warn(format!(
+                            "Model returned only reasoning with no answer or tool call (attempt {attempt}/{max_reprompts}); sending reprompt message"
+                        ));
+                        turn_error = None;
+                        continue;
                     }
 
                     crate::logging::warn(format!(
