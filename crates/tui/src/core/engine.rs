@@ -568,7 +568,9 @@ impl Default for EngineConfig {
             goal_max_continuations: crate::goal_loop::DEFAULT_MAX_GOAL_CONTINUATIONS,
             goal_continuation_delay_seconds: 0,
             reasoning_only_max_reprompts: crate::config::DEFAULT_REASONING_ONLY_REPROMPTS,
-            reasoning_only_reprompt_message: Some(crate::config::DEFAULT_REASONING_ONLY_REPROMPT_MESSAGE.to_string()),
+            reasoning_only_reprompt_message: Some(
+                crate::config::DEFAULT_REASONING_ONLY_REPROMPT_MESSAGE.to_string(),
+            ),
             allowed_tools: None,
             disallowed_tools: None,
             max_tool_calls: None,
