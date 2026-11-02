@@ -3913,6 +3913,7 @@ async fn auto_uses_node_for_the_session_when_the_bun_host_fails_to_start() {
 /// `--max-old-space-size` never bounded. Linux and Windows: the kernel fails
 /// the allocation at 1 GiB. macOS: Bun's jetsam limit gets the host killed by
 /// the kernel; a Node host is killed by the heartbeat check.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 async fn memory_hog_is_stopped(
     manager: Arc<ExtensionHostManager>,
     fixture: &FixturePlugins,
@@ -3982,6 +3983,7 @@ async fn memory_hog_is_stopped(
     manager.shutdown().await;
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn memory_cap_supervision() -> super::SupervisionOptions {
     super::SupervisionOptions {
         // Linux cannot start either runtime under much less than 1 GiB of
