@@ -1,7 +1,8 @@
 # 工具表面（tool surface）
 
 > 英文原文：[TOOL_SURFACE.md](../TOOL_SURFACE.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> 最后与英文同步日期（last synced with English revision）：2026-10-17。
+> 2026-10-06 补齐本地解释器权限与后端限制；现有 MCP 有界发现段落已核对。
 
 本文描述当前面向模型的工具（tool）契约。产生它的 v0.9.1 切换记录在
 `docs/RUNTIME_SIMPLIFICATION_DESIGN.md` 中；工作区版本请从 `Cargo.toml` 读取，
@@ -19,26 +20,29 @@
 
 ## 默认激活契约
 
-新回合开始时带有十一个预加载（eager）的原生名称，外加合成的 `tool_search`：
+新回合开始时带有十三个预加载（eager）的原生名称，外加合成的 `tool_search`：
 
 1. `read`
 2. `write`
 3. `edit`
-4. `bash`
-5. `agent`
-6. `workflow`
-7. `todo_write`
-8. `create_goal`
-9. `get_goal`
-10. `update_goal`
-11. `load_skill`
-12. `tool_search`（合成，始终激活）
+4. `file_search`
+5. `bash`
+6. `agent`
+7. `workflow`
+8. `todo_write`
+9. `create_goal`
+10. `get_goal`
+11. `update_goal`
+12. `task_shell_wait`
+13. `load_skill`
+14. `tool_search`（合成，始终激活）
 
-这十一个原生名称就是 `crates/tui/src/core/engine/tool_catalog.rs` 里的
+这十三个原生名称就是 `crates/tui/src/core/engine/tool_catalog.rs` 里的
 `DEFAULT_ACTIVE_NATIVE_TOOLS`，由
 `default_active_contract_keeps_discovery_and_core_tools_eager` 固定住。
 权限边界（authority boundary）可以在子智能体达到最大深度时移除 `agent`，
-但仅凭路由大小不得改变这套核心词汇。
+Plan 只注册前台 shell 表面（因此没有 `task_shell_wait`），但仅凭路由大小不得改变
+这套核心词汇。
 
 直接 schema 刻意保持精简：
 
@@ -47,6 +51,7 @@
 | `read` | `path`、可选的 `offset`、可选的 `limit` | 读取一个有界的文件窗口，并给出明确的续读或截断提示。 |
 | `write` | `path`、`content` | 创建或替换文件。 |
 | `edit` | `path`、`edits` | 针对同一份原始快照应用一处或多处无歧义的文本替换。 |
+| `file_search` | `query`，以及可选的 `path`、`limit`、`extensions`、`exclude` | 按文件名、路径片段或 glob 查找文件，返回有界的排序结果。遵循忽略文件；`exclude` 会替换默认排除规则。 |
 | `bash` | `command`、可选的 `timeout` | 运行一条可取消的前台 shell 命令，并返回有界的尾部输出。 |
 | `agent` | 被委派的任务以及可选的作用域/上下文控制项 | 启动或查看专注的子智能体任务。 |
 | `workflow` | plan/script/source_path 加上运行控制项 | 用依赖关系和完成检查来协调多智能体阶段。 |
@@ -54,6 +59,8 @@
 | `create_goal` | 目标文本以及可选预算 | 启动本回合所追求的会话目标（goal）。 |
 | `get_goal` | 无 | 读取当前生效的目标及其进度。 |
 | `update_goal` | 终态状态 | 把目标标记为完成或受阻。 |
+| `task_shell_wait` | `task_id`，以及可选的 `wait`、`timeout_ms`、`cancel`、`gate` | 轮询或停止一个后台 shell 任务。完成结果仍会作为运行时事件到达，因此只在需要提前输出、真正的依赖屏障或闸门证据时使用。 |
+| `load_skill` | 可选的 `name`、`query` | 加载命名技能的 `SKILL.md` 正文及配套文件列表；省略 `name` 或使用 `name="list"` 列出可调用技能，也可用 `query` 搜索名称与描述。 |
 | `tool_search` | `query`、可选的匹配控制项 | 发现策略允许的延迟工具，并把选中的 schema 加入本次对话的工具箱。 |
 
 模式是一项权威决定，而不是同义词体系。Plan、Work 和 Operate 使用同一套原语身份。
@@ -64,6 +71,27 @@ Full Access（完全访问）会改变常规审批行为，但不会绕过硬性
 `update_plan` 仅为已保存工件（artifact）的兼容性而保留注册，对模型不可见。
 `tasks`、`Git`、`Run`、`Web`、`remember` 以及其他专门能力都是可搜索的，
 而不是首回合的必备仪式。
+
+在 TUI 默认的（calm）shell 卡片上，Bash 描述是标题，按原文显示（仅去除终端转义序列、合并空白并限制长度），
+命令则在其正下方单独占一行 `$`，在每种状态、每种宽度下都是如此，自动运行也不例外；
+没有描述的卡片改以 `$` 命令作标题。带标签的卡片（`show_tool_details = true` 且
+`calm_mode = false`）把命令保留在卡片头部，描述作为弱化的 `note:` 行。描述从不取代命令，
+也不参与执行、精确审批键和 Auto-Review 输入。原始描述保留在记录的工具输入和导出中。
+审批提示、`/jobs`、活动检查器、ACP 和其他 Runtime 客户端仍然显示命令；这项改动不会在
+这些界面上增加描述行。
+
+## 本地代码执行
+
+`code_execution`（Python）与 `js_execution`（Node.js）使用工作区任务门禁/测试
+共用的权限感知启动器。常规调用保留会话策略。对被拒绝的精确调用申请更宽权限时，
+提供 `sandbox_permissions`（`workspace-write` 或 `danger-full-access`）与非空
+`justification`；Ask 模式需用户明确批准一次。获准策略只作用于该调用。
+
+两种工具从 stdin 读代码，返回 stdout / stderr / return_code，保留超时及进程树
+清理。它们不是持久 REPL；异常堆栈指向 stdin。独立 RLM/REPL 内核不受此次启动器
+整合影响。共享启动器的平台限制仍适用：没有可用的本地包装器时，workspace-write
+无法强制执行，read-only 则被拒绝。外部 sandbox 会话必须使用自己的 shell 路径，
+不能借此运行本地解释器。参见[沙箱限制](SANDBOX.md)。
 
 ## 延迟与动态工具
 
@@ -82,6 +110,12 @@ Full Access（完全访问）会改变常规审批行为，但不会绕过硬性
 MCP 工具是动态的。连接成功的服务器会从 `~/.codewhale/mcp.json` 注册
 诸如 `mcp_<server>_<tool>` 这样的名称；失败或已禁用的服务器不得被呈现为可用。
 除非用户在 `[tools].always_load` 中明确点名，MCP 与插件工具都是延迟的。
+
+对于尚未启动的已配置服务器，面向 MCP 的 `tool_search` 先在当前回合的服务器与
+工具权限范围内执行有界发现。连接后搜索服务器实际提供的模式，不会虚构
+`mcp_*` 定义。在 `execute_tools` 内搜索只描述模式而不激活；直接搜索沿用现有的
+有界激活缓存。无关的普通搜索不会启动可选服务器。CLI 的独立 MCP 检查命令
+使用单独的连接池。
 
 ### 代码模式（`execute_tools`）
 
@@ -123,10 +157,25 @@ MCP 工具是动态的。连接成功的服务器会从 `~/.codewhale/mcp.json` 
 
 ### 对话工具箱缓存
 
-一次成功的搜索激活会按名称记入当前对话。缓存最多保存八个延迟名称和
-16 KiB 的序列化 schema，按最近最少使用淘汰条目，并在再次对外告知之前，
-让每个条目对照当前目录与策略重新校验。会话同步会清空它。
+一次成功的搜索激活会按名称记入当前对话。软目标是八个延迟名称和 16 KiB 的新增
+实际传输 schema；字节数通过生产路由的转换之后，相对于预加载工具基线计算。
+适配器无法测量时，字节数保持未知，不使用内部 `Tool` 序列化替代。
+需要腾出空间时，先淘汰从未被调用过的工具（最早激活的先淘汰），
+再淘汰最久未被调用的工具；在当前回合或上一回合调用过的工具永远不会被淘汰。
+如果这类工具已经占满缓存，搜索仍会越过上限激活最佳匹配，其余匹配暂不加载；
+等这些工具不再被使用后，之后的某次激活会把缓存恢复到上限以内。每个条目在再次对外告知之前，
+都会对照当前目录与策略重新校验。会话同步会清空它。
 缓存无法让已移除、已被拒绝或刚刚变为预加载的工具复活。
+
+如果某次搜索的激活把之前激活的工具挤出了缓存，这次搜索的结果会在
+`evicted_tool_references` 中列出它，告诉模型该工具已不可调用，而不是让它在下一次请求里
+悄悄消失。暂不加载的匹配列在 `unavailable_tool_references` 中。两者都带有
+`tool_search_input`：一条只匹配该名称的精确正则查询，用它调用 `tool_search` 即可重新加载。
+只列出真正离开激活集合的工具；刚刚变为预加载的工具仍可调用，不会列出。
+每次搜索还在 `toolbox` 中返回当前 `active_deferred_tools` 快照和传输字节数。
+新激活明确取代同一名称更早的移除或不可用通知。
+其他已声明的工具箱改变，包括重新校验和直接首次激活，会在下一次模型请求前
+追加当前延迟工具箱快照。它取代旧的可用性通知，不改写先前历史。
 
 每个子智能体都有自己的、经策略过滤的延迟目录，始终存在的 `tool_search`，
 以及有界的激活缓存。分叉出来的消息和指令仍留在上下文（context）中，
@@ -144,7 +193,8 @@ MCP 工具是动态的。连接成功的服务器会从 `~/.codewhale/mcp.json` 
 1 MiB 的检查上限之内时，它才会报告模型客户端工具 JSON 的确切字节数和
 SHA-256 摘要；更大的载荷保持不可用。提供商（provider）适配器在构建
 提供商专属的实际传输请求体时，可能会转换、净化或省略这些字段，因此 `/tools`
-会把提供商投递和实际传输的载荷标记为不可用。捕获与渲染都是有界的：保留的 schema、
+会把提供商投递和实际传输的载荷标记为不可用。[CACHE.md](CACHE.md) 中的独立请求回执
+会测量生产传输 schema，并关联提供商报告的用量。捕获与渲染都是有界的：保留的 schema、
 描述、调用方列表、目录行、回合 ID 和载荷测量，都带有明确的截断、省略或不可用回执。
 快照只在当前会话期间留在内存里，并在每次准备好请求时被替换。
 
@@ -183,8 +233,9 @@ SHA-256 摘要；更大的载荷保持不可用。提供商（provider）适配�
 ## 长时间运行的工作
 
 `bash` 只运行一条可取消的前台命令。它不携带 background、TTY、wait、interact
-或 cancel 动作字段。有状态的进程与终端控制属于专门功能，必须被显式发现；
-它不会扩大首回合的 shell schema。
+或 cancel 动作字段。有状态的进程与终端控制保持在 shell schema 之外：
+`task_shell_wait` 对 `bash` 启动的后台任务预加载，交互式终端控制仍需经
+`tool_search` 发现；这些控制不会扩大首回合的 shell schema。
 
 当工作本身需要可持久化的生命周期、结构化闸门、工件、可重放时间线或稳定的
 任务 id 时，请使用 `tasks`。大型工具结果应当留在有界的句柄或工件之后，
@@ -279,6 +330,6 @@ cargo test --locked -p codewhale-tui --lib core::engine::tests::print_mode_tool_
 `1 passed`（被忽略的指标测试报告 `1 passed` 只是因为 `--ignored` 选中了它）；
 `0 passed` 意味着过滤器没匹配到任何东西，检查根本没跑。
 
-不依赖提供商的回执必须报告上面列出的十一个默认激活名称。另一份仓库范围的
+不依赖提供商的回执必须报告上面列出的十三个默认激活名称。另一份仓库范围的
 工具计数可能包含延迟、动态、受特性开关控制以及仅为兼容而存在的注册；
 它不是放进首回合模型目录的工具数量。

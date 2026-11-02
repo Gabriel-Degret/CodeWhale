@@ -18,27 +18,27 @@ The internal runtime type is `FleetRole` (formerly
 compatibility adapter during v0.9.x. New prompts and config should use fleet
 names.
 
-Architecturally, sub-agents should not be a second execution substrate. The
-durable primitive is the fleet-backed worker run described in
-[`AGENT_RUNTIME.md`](AGENT_RUNTIME.md): retries, terminal status, receipts,
-artifact refs, inspection, and restart behavior belong there. The
-model-facing launcher is the single `agent` tool and detached work should
-converge on the same lifecycle as Agent fleet.
+Child assignments run through the same `Engine::run_turn` planner, executor,
+Session and approval inbox as ordinary turns. The private captured ChildGrant
+narrows tool actions, shell, workspace, network and descendant depth at the final
+execution boundary. The existing SubAgentManager still owns launch slots,
+coordination, worker checkpoints and terminal delivery; it does not run another
+model/tool loop. Work uses the full explicit owner limit. At the limit the host
+preserves a partial-result receipt without an extra model reporting request.
 
-The current `agent` implementation delegates to the durable sub-agent runtime
-while that cutover completes. It can still be useful for short in-session
-delegation. Transient provider header/stream/time-out failures are retried with
-backoff inside the child runtime before the worker is marked interrupted; if the
-retry budget is exhausted, Codewhale preserves a checkpoint and returns a
-continuation handle instead of leaving the parent to infer what happened. For
-work that must survive process restarts, sleep, or remote execution, prefer
-fleet or a Workflow-backed fleet run.
+Transient provider failures use Core's dispatch and retry boundaries. An exhausted
+budget or interrupted request preserves the recorded checkpoint and a continuation
+handle. Each actually dispatched attempt carries its original session, route and
+source identity: provider usage is billed once, then projected to the worker
+ledger. A successful response without usage and an unknown request outcome retain
+distinct coverage gaps; neither is priced as zero. For work that must survive
+process restarts, sleep or remote execution, use Fleet or a Workflow-backed run.
 
 Sub-agents inherit the parent's permitted tool registry, including `agent`
 coordination. Spawning obeys one absolute depth ceiling: the root is depth 0,
 its child is depth 1, and a child at `max_spawn_depth` cannot spawn again.
-The operator default is 3, with a hard ceiling of 8. A role, saved profile, or
-compatibility request can only narrow that ceiling. Recovery and transcript
+The default has no product depth cap. Explicit operator, role and saved-profile
+limits still narrow descendant authority; model requests cannot choose caps. Recovery and transcript
 forking retain the source's position and bounds; they do not buy another
 generation. The removed `agent_open`/`agent_eval`/`agent_close` lifecycle tools
 are absent from every registry.
@@ -123,8 +123,9 @@ floor and one-shot model guardian decide a worker's held calls (never a
 prompt; an unavailable guardian denies, fail closed); under Ask a held call
 the role cannot delegate is raised as an approval prompt in the parent's
 UI and the worker waits visibly (`waiting for user`), or is denied with the
-reason on hosts that cannot prompt; Full Access still fails closed on the
-non-bypassable safety floor. Each decision nobody was prompted for is a
+reason on hosts that cannot prompt; Full Access applies
+exactly as it does to the parent turn, so a call the person granted is not
+stranded by the Auto-Review floor. Each decision nobody was prompted for is a
 one-line note in that worker's transcript (visible when it is focused) and
 an audit-log record. See `docs/MODES.md`.
 
@@ -159,9 +160,9 @@ turn is included.
 
 **The list is shown once, at that spawn, and never re-sent.** No sub-agent
 request re-states a To-do list, and neither does a parent request. Each agent
-keeps its own private list (#4810); what it knows about that list comes from the
-tool results its own `todo_write` calls returned, which are ordinary messages in
-its own transcript. A worker therefore cannot read or write a parent's or a
+keeps its own private list (#4810); what it knows about that list comes from its
+own `todo_write` calls (each sends the whole list) and the short receipts they
+returned, which are ordinary messages in its own transcript. A worker therefore cannot read or write a parent's or a
 sibling's list, and a forked child cannot mutate the snapshot it was handed or
 keep reading later parent changes.
 
@@ -323,13 +324,24 @@ a shared write claim. For arbitrary analysis code, call `bash` with explicit
 }
 ```
 
-This mode requires native filesystem read-only isolation and denies network
-access. It accepts only foreground `run` with `command`, optional `cwd`, and
-`timeout_ms`. Background or interactive modes, stdin, sandbox escalation, and
-external execution backends are incompatible. If native enforcement is absent
-or cannot be prepared, the call refuses before executing the command; the flag
-never falls back to trusting a promise that the code only reads. Existing role,
-tool, and ancestor policy restrictions still apply.
+This mode requires native filesystem read-only isolation. Outbound network
+follows the caller's own shell and is on only when the session runs in Full
+Access, its sandbox allows network, its `[network]` policy does not default to
+deny, and the agent keeps its network grant; in Ask or Auto-Review, where a
+networked command needs an approval this mode never asks for, it stays offline.
+With network on, `curl` and HTTPS clients work. `read_only` blocks local file
+writes, not requests that change remote services. On macOS the mode then reaches
+hosts over IPv4, the system DNS resolver, and a local proxy named in
+`HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`, but not IPv6, another port on this
+machine's own addresses, or a local socket. On Linux it shares the host network
+namespace, including loopback and abstract unix sockets, as a networked
+workspace-write shell does. A networked run records `sandbox_network: true` in
+its tool-result metadata. It accepts only foreground `run` with `command`,
+optional `cwd`, and `timeout_ms`. Background or interactive modes, stdin,
+sandbox escalation, and external execution backends are incompatible. If native
+enforcement is absent or cannot be prepared, the call refuses before executing
+the command; the flag never falls back to trusting a promise that the code only
+reads. Existing role, tool, and ancestor policy restrictions still apply.
 
 For a write refusal outside your own scope, `agent(action="claim", ...)` can
 add permitted paths to your claim. It cannot take a live peer's claim. Wait for
@@ -356,14 +368,11 @@ STOP_CONDITION:
 OUTPUT: VERDICT, EVIDENCE, GAPS, NEXT
 ```
 
-`scout` briefs default to quick, read-only investigation (no writes, but
-network reach and the bounded verification surface are available for real
-scouting). A quick scout usually needs only a handful of calls: orient,
-search, read the decisive lines, and return — but stop at decisive evidence,
-not at a number. There is no per-agent call cap to save; the runtime budgets
-depth and concurrency, not curiosity. Do not repeat `ALREADY_KNOWN` work
-unless evidence contradicts it. Builder and repair-style briefs should use
-checkpoints before scope expansion or after repeated failures.
+`scout` briefs request read-only investigation with enough evidence to answer
+the question reliably. Let the task determine the depth of investigation.
+Do not repeat `ALREADY_KNOWN` work unless evidence contradicts it. Builder and
+repair-style briefs should use checkpoints before scope expansion or after
+repeated failures, then adapt and continue the remaining authorized work.
 
 Good delegation prompt examples:
 
@@ -387,7 +396,7 @@ OUTPUT: VERDICT, EVIDENCE, GAPS, NEXT.
 
 ```text
 QUESTION: Is the focused prompt/subagent test filter valid, and what fails if not?
-SCOPE: cargo test -p codewhale-tui --bin codewhale-tui --locked prompt; subagent filter if needed.
+SCOPE: cargo test -p codewhale-tui --lib --locked prompt; subagent filter if needed.
 ALREADY_KNOWN: Do not fix failures; capture exact command, exit code, and first relevant assertion.
 EFFORT: medium
 STOP_CONDITION: Stop after one clean PASS or one reproducible failing assertion with command evidence.
@@ -496,7 +505,7 @@ While the governor is holding launches back, it says so in two places:
 - a queued agent's row gives the reason, for example
   `launch slots throttled to 4/8 after 2 provider rate limit(s) in the last 60s`
   or `launches paused after 4 provider rate limit(s) in the last 60s`, and the
-  time its wall budget ends;
+  time its owner-configured wall budget ends, if one exists;
 - `GET /v1/agent-runs` returns a `governor` object next to `runs`, with
   `launch_slots`, `max_launch_slots`, `paused`, `recent_rate_limits`, and a
   `status` line while launches are held back. It describes launches made by the
@@ -517,13 +526,13 @@ and aliases such as `glm` for Z.ai:
 max_concurrent = 20
 launch_concurrency = 20
 max_admitted = 200
-# Operator-selected Runtime delegation depth. The default is 3; this explicit
-# value opts in above the default but remains below the hard ceiling of 8.
+# Operator-selected Runtime delegation depth. Omit to leave it uncapped.
+# This explicit value restricts descendants to six levels.
 max_depth = 6
 # Omitted or zero model-step budget is unbounded. Set a positive value only
 # when an operator deliberately wants a per-child cap.
 default_max_steps = 0
-default_wall_time_secs = 1800
+default_wall_time_secs = 0
 
 [subagents.providers.deepseek]
 # Direct API key with room to fan out.
@@ -562,7 +571,6 @@ The model-facing `agent` schema exposes these controls:
 | --- | --- |
 | Launch and route | `action`, `prompt`, `type`, `profile`, `name`, `model`, `model_strength`, `thinking` |
 | Scope and outputs | `worktree`, `cwd`, `write_authority`, `write_roots`, `exact_files`, `coordination_contracts`, `deliverables`, `expected_artifact` |
-| Narrow run limits | `max_steps`, `wall_time_secs` |
 | Coordinate and recover | `agent_id`, `agent_ids`, `all_parked`, `message`, `until`, `detached`, `resume_from` |
 | Inspect | `detail`, `offset`, `limit` |
 
@@ -607,9 +615,9 @@ internal/operator compatibility. Runtime validates and intersects them with
 live policy:
 
 - delegation compatibility: `max_depth`, `maxDepth`, or `max_spawn_depth`;
-  values are restricted to 0 through the Runtime hard ceiling of 8 and only
-  narrow the inherited absolute ceiling. Model-facing calls inherit depth
-  from the operator and selected profile.
+  model-facing calls ignore these values and inherit depth from the operator
+  and selected profile. Exact Fleet authority still supplies its validated
+  depth ceiling.
 - workspace/isolation: `workspace_policy`, `fork_context`,
   `worktree_path`, `worktree_branch`, `worktree_base`
 - spawn contract: `deliberate`, `dependencies`, `acceptance`, `allowed_tools`
@@ -619,98 +627,64 @@ live policy:
 Compatibility input is not a way to widen inherited authority or remove a
 finite budget.
 
-## Child budgets (steps, wall time, tokens)
+## Child limits and completion
 
-`max_steps` and `wall_time_secs` are optional per-call limits.
-Each can only narrow the applicable role, operator, parent, and saved-run
-limits; the one exception is that `wall_time_secs` may raise the built-in
-1800-second default (see below). Omission inherits those limits; explicit zero, null, negative, or
-out-of-range values are rejected by the tool parser (schema minimum is 1).
-Fleet file task-specs use a different convention — there, omitted-or-zero
-means unbounded; see `docs/FLEET.md`.
+Children have no default model-turn or wall-clock limit. They continue until
+completion, a need for user input, cancellation, or an explicit owner limit.
+Elapsed time and step counts do not establish whether useful work is finished.
+The runtime does not inject percentage-based instructions to stop exploring or
+wrap up early.
 
-`max_steps` counts model turns and accepts 1 through 2000. All roles default
-to no model-turn cap unless an operator or ancestor supplies one; the internal
-zero representation for that default never cancels a finite inherited cap.
-`wall_time_secs` accepts 1 through 86400. Omitted, it defaults to 1800
-seconds. An explicit value may go above that built-in default, for long
-unattended work; an operator-configured `default_wall_time_secs` is both the
-default and a ceiling, and role, parent, and saved-run deadlines still only
-narrow. It covers model requests and tools. The effective absolute deadline
-is persisted, and saved again when a queued agent launches, so a later
-continuation is bounded by the deadline the agent actually worked to.
+The model-facing `agent` tool does not advertise `max_steps`, `wall_time_secs`,
+or `max_output_tokens`. Valid legacy inputs still parse, but do not constrain
+model-launched children. A launch receipt lists `ignored_limit_fields` when
+those inputs are supplied; `effective_limits` shows what actually applies.
+Models should specify the task, write scope, deliverables and acceptance criteria,
+not guess how many turns or minutes completion will require.
 
-The work clock starts when the agent gets a launch slot. An agent that waits
-in the launch queue waits at most `wall_time_secs`; if no slot opens in that
-time it fails with a `never started` reason and zero steps, instead of being
-reported as a run that used up its budget. An agent that does get a slot
-after waiting receives its full `wall_time_secs` from that moment, still
-bounded by any parent, saved-run or source deadline. So a parent can wait up
-to about twice `wall_time_secs` for a queued agent. The queued row names the
-reason for the wait and the time the agent stops waiting. If agents often
-wait long, start fewer at once.
+An operator can deliberately set `[subagents] default_max_steps` or
+`default_wall_time_secs`. Omission or zero means no limit. Positive owner
+limits and role, parent and saved-run bounds remain authoritative; a child
+cannot remove them. There is no additional 2,000-turn or 24-hour child ceiling.
+Continuations preserve an existing run's remaining steps and absolute deadline.
 
-For example, a focused review can request:
+Concurrency limits queue work rather than giving it a guessed completion budget.
+Without an owner deadline, a queued child waits for a slot or cancellation. With
+an explicit wall budget, its queue wait is bounded by that duration; if no slot
+opens it reports `never started` with zero work. After launch its work clock
+restarts within any inherited absolute deadline, which is persisted for
+continuation. The queued row reports the wait reason and any actual deadline.
+
+For example:
 
 ```json
 {
   "action": "start",
   "type": "reviewer",
-  "prompt": "Review the parser diff and report concrete regressions.",
-  "max_steps": 12,
-  "wall_time_secs": 300
+  "prompt": "Review the parser diff and report concrete regressions with file and line evidence."
 }
 ```
 
-The receipt's `effective_limits` is authoritative; a request for 300 seconds
-cannot extend a parent's earlier deadline. A continuation keeps the source's
-remaining steps, original deadline, and token history. A new ID, role, or
-`resume_from` fork cannot reset those bounds.
+### Usage and partial results
 
-### Token accounting and partial results
+Token usage is tracked, never used as a run-wide kill budget. Legacy
+`token_budget` input is ignored. Provider-reported usage is the accounting
+source; missing usage remains unknown. Context compaction lets a child
+continue as its conversation grows. Provider context windows and output limits
+still apply to individual requests, and incomplete tool arguments are never
+executed.
 
-Token budgets were retired in 0.9.14: token usage is tracked, never
-enforced — runs are no longer stopped by token accounting. Legacy input that
-still carries `token_budget` parses and is ignored; `max_steps` and
-`wall_time_secs` remain the narrowable per-call limits.
+When an explicit owner step or time limit ends a run, the existing hand-back
+path preserves partial work and attempts one tools-disabled report within the
+remaining allowance. Its fixed input/output allowance is at most 8,192 tokens,
+with at most 1,024 output tokens. A step limit of at least two reserves one turn;
+a wall limit reserves at most 10 seconds for reporting. These reserves do not
+create a limit on an otherwise unbounded run.
 
-The governor uses provider-reported input plus output tokens, not a local
-estimate presented as a bill. Request output is capped to the remaining
-allowance. Unknown prompt usage and requests already in flight can overshoot;
-receipts retain the full reported usage. Missing usage remains unknown.
-Worker records distinguish the worker's own token totals from shared
-`budget_spent_tokens` and `budget_remaining_tokens`; do not sum a shared
-pool once for every descendant.
-
-The worker reserves room for one final report inside these limits: up to 10%
-of a token allowance (at most 8192 tokens, only when at least 1024 can be
-reserved), one turn when the step cap permits at least two, and up to 10% of
-wall time (at most 10 seconds). Ordinary task execution stops before using
-that reserve. Shared scopes hold back one token reserve for the scope;
-reporting workers atomically claim remaining headroom so siblings cannot
-independently reuse it. Continuation never refunds measured usage or resets
-the original deadline.
-
-The final reporting turn uses the worker's existing resolved provider and
-model, with tools disabled and at most 1024 output tokens. It consolidates
-bounded assistant notes and tool results into findings, evidence, produced
-files, unfinished work and next steps. Estimated input cost counts against
-its allowance. Provider transport retries remain inside the one logical
-turn and its original wall-time deadline; no worker summary retry loop is
-added. Token estimates are not billing receipts: unknown provider input and
-requests already in flight can still overshoot, and actual usage is recorded.
-
-The outcome stays `BudgetExhausted`, even when a useful report is obtained,
-with the specific cause, checkpoint, measured usage and normal deliverable
-verdicts. If the allowance is too small or already spent, earlier bounded
-usage is unknown, the provider fails, or time expires, the worker returns
-recorded partial text and says why a model report was unavailable.
-Known missing response usage and attempts interrupted by timeout or cancellation
-stay recorded across continuations and shared siblings; later known usage remains a
-subtotal and cannot restore reporting headroom in that bounded scope.
-Cancellation wins over reporting. Missing usage stays unknown. Exhausted
-scopes reject further spawns or continuations; a partial report is not
-successful completion.
+The outcome remains `BudgetExhausted` rather than successful completion, even
+when a useful partial report is available. If reporting cannot run, the receipt
+retains recorded work and explains why. Cancellation remains available during
+work and queue waits. Unknown provider usage is never reported as zero.
 
 ## Per-role models (#3018)
 

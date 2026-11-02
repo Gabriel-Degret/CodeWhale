@@ -11,7 +11,7 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use unicode_width::UnicodeWidthStr;
 
-use crate::config::{ApiProvider, ApprovalPolicyControl, Config};
+use crate::config::{ApprovalPolicyControl, Config, ProviderKind};
 use crate::features::{FEATURES, Stage};
 use crate::settings::Settings;
 use crate::tools::UserInputResponse;
@@ -122,7 +122,11 @@ pub(crate) fn render_modal_surface(area: Rect, popup_area: Rect, buf: &mut Buffe
 
     Clear.render(popup_area, buf);
     Block::default()
-        .style(Style::default().bg(palette::WHALE_BG))
+        .style(
+            Style::default()
+                .fg(palette::TEXT_PRIMARY)
+                .bg(palette::WHALE_BG),
+        )
         .render(popup_area, buf);
 }
 
@@ -146,7 +150,11 @@ pub(crate) fn render_underwater_surface(
     };
     Clear.render(area, buf);
     Block::default()
-        .style(Style::default().bg(palette::WHALE_BG))
+        .style(
+            Style::default()
+                .fg(palette::TEXT_PRIMARY)
+                .bg(palette::WHALE_BG),
+        )
         .render(area, buf);
     // Ratatui clips long block titles at the border edge without signalling
     // that anything is missing. Reserve the corner cells and semantic-ellipsis
@@ -162,7 +170,11 @@ pub(crate) fn render_underwater_surface(
         )))
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(palette::BORDER_COLOR))
-        .style(Style::default().bg(palette::WHALE_BG))
+        .style(
+            Style::default()
+                .fg(palette::TEXT_PRIMARY)
+                .bg(palette::WHALE_BG),
+        )
         .padding(Padding::new(1, 1, u16::from(area.height >= 24), 0));
     let inner = block.inner(surface);
     block.render(surface, buf);
@@ -786,10 +798,7 @@ pub enum ViewEvent {
     /// status message.
     ModelPickerApplied {
         model: String,
-        provider: Option<crate::config::ApiProvider>,
-        /// Exact named custom route key when the selected provider enum is
-        /// `Custom`; built-in routes leave this unset.
-        provider_id: Option<String>,
+        identity: Option<crate::config::ProviderIdentity>,
         effort: crate::reasoning_preference::ReasoningEffort,
         previous_model: String,
         previous_effort: crate::reasoning_preference::ReasoningEffort,
@@ -811,13 +820,13 @@ pub enum ViewEvent {
     /// Re-resolve readiness + rebuild catalog rows for the open model picker.
     ModelPickerRefresh,
     ModelPickerTogglePin {
-        provider: crate::config::ApiProvider,
+        provider: crate::config::ProviderKind,
         /// Exact named route for `Custom`; built-in providers leave this unset.
         provider_id: Option<String>,
         model: String,
     },
     ModelPickerMovePin {
-        provider: crate::config::ApiProvider,
+        provider: crate::config::ProviderKind,
         /// Exact named route for `Custom`; built-in providers leave this unset.
         provider_id: Option<String>,
         model: String,
@@ -826,7 +835,7 @@ pub enum ViewEvent {
     /// `⇧F` in the picker: add the row's exact route to the team (the
     /// selected saved team), or remove it when it is already there (design §10 F1).
     ModelPickerToggleFleet {
-        provider: crate::config::ApiProvider,
+        provider: crate::config::ProviderKind,
         /// Exact named route for `Custom`; built-in providers leave this unset.
         provider_id: Option<String>,
         model: String,
@@ -839,7 +848,7 @@ pub enum ViewEvent {
     },
     FleetProfileRoutePicked {
         editor_id: uuid::Uuid,
-        provider: crate::config::ApiProvider,
+        provider: crate::config::ProviderKind,
         provider_id: Option<String>,
         model: String,
         reasoning: Option<crate::reasoning_preference::ReasoningEffort>,
@@ -862,14 +871,14 @@ pub enum ViewEvent {
     FleetRoutePicked {
         target: crate::tui::views::fleet_detail::FleetRouteTarget,
         editor_id: uuid::Uuid,
-        provider: crate::config::ApiProvider,
+        provider: crate::config::ProviderKind,
         /// Exact named route for `Custom`; built-in providers leave this unset.
         provider_id: Option<String>,
         model: String,
         reasoning: Option<crate::reasoning_preference::ReasoningEffort>,
     },
     ModelPickerNeedsAuth {
-        provider: crate::config::ApiProvider,
+        identity: crate::config::ProviderIdentity,
         model: String,
         reason: String,
     },
@@ -894,16 +903,14 @@ pub enum ViewEvent {
     /// that already has credentials — the handler should perform the same
     /// switch as `AppAction::SwitchProvider`.
     ProviderPickerApplied {
-        provider: crate::config::ApiProvider,
-        provider_id: Option<String>,
+        identity: crate::config::ProviderIdentity,
     },
     /// Emitted by the `/provider` picker after the user types an API key
     /// inline for a provider that lacked one. The handler validates the key
     /// live; on success it reopens the guided flow at the model-pick stage
     /// without persisting yet (#3875).
     ProviderPickerApiKeySubmitted {
-        provider: crate::config::ApiProvider,
-        provider_id: Option<String>,
+        identity: crate::config::ProviderIdentity,
         api_key: String,
         /// Endpoint chosen in the wizard's billing-route stage, applied to the
         /// verification config only — nothing is written until confirm (#4526).
@@ -913,8 +920,7 @@ pub enum ViewEvent {
     /// accepted provider + model. The handler persists the key (and model)
     /// via the comment-preserving config path, then performs the switch.
     ProviderPickerSetupConfirmed {
-        provider: crate::config::ApiProvider,
-        provider_id: Option<String>,
+        identity: crate::config::ProviderIdentity,
         api_key: String,
         model: String,
         context_window: Option<u32>,
@@ -933,31 +939,37 @@ pub enum ViewEvent {
     },
     /// Emitted by provider/setup UI when xAI device-code OAuth is requested.
     ProviderPickerXaiOAuthRequested,
+    ProviderPickerClaudeOAuthRequested,
     /// Emitted by provider/setup UI when native ChatGPT PKCE sign-in is requested.
     ProviderPickerChatgptOAuthRequested,
+    /// Emitted by provider/setup UI when OrcaRouter OAuth 2.0 + PKCE sign-in is
+    /// requested. The picker only emits this after the user chose "Connect with
+    /// OrcaRouter" from the two-option OrcaRouter auth screen.
+    ProviderPickerPluginOAuthRequested {
+        provider: String,
+    },
+    ProviderPickerOrcarouterOAuthRequested,
     /// Emitted only after the picker showed owner, exact path, and the full
     /// read-only side-effect contract and the user explicitly confirmed it.
     ProviderPickerExternalConsentConfirmed {
-        provider: crate::config::ApiProvider,
+        provider: crate::config::ProviderKind,
         consent_provider: codewhale_config::ProviderKind,
         source: codewhale_config::ExternalCredentialSource,
         path: std::path::PathBuf,
     },
     /// One-step revocation from a provider row that currently has consent.
     ProviderPickerExternalConsentRevoked {
-        provider: crate::config::ApiProvider,
+        provider: crate::config::ProviderKind,
     },
     /// Emitted by the `/provider` picker (the `M` action) to jump straight to
     /// the `/model` picker pre-filtered to the highlighted provider (#3083).
     ProviderPickerOpenModels {
-        provider: crate::config::ApiProvider,
-        provider_id: Option<String>,
+        identity: crate::config::ProviderIdentity,
     },
     /// Emitted by `/provider` `T`: probe `/models` and refresh readiness
     /// without treating a 2xx as model-ready (#5350).
     ProviderPickerTestConnection {
-        provider: crate::config::ApiProvider,
-        provider_id: Option<String>,
+        identity: crate::config::ProviderIdentity,
         /// Restore Catalog vs Configured after the probe. Must not force
         /// the all-providers catalog if the user was on configured-only.
         catalog_view: bool,
@@ -1185,6 +1197,9 @@ pub enum ViewAction {
 
 pub trait ModalView: std::any::Any {
     fn kind(&self) -> ModalKind;
+    fn input_context_id(&self) -> usize {
+        0
+    }
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction;
     /// Returns `true` if the modal consumed the paste; `false` to let the
     /// host route the text elsewhere (e.g. drop it because a modal is open,
@@ -1228,6 +1243,17 @@ pub trait ModalView: std::any::Any {
     fn approval_request_id(&self) -> Option<&str> {
         None
     }
+
+    /// The tool decision this card waits on, including an elevation retry.
+    /// Retirement shares identity without granting initial approval authority.
+    fn tool_decision_request_id(&self) -> Option<&str> {
+        self.approval_request_id()
+    }
+
+    /// The human-question tool id, kept separate from approval authority.
+    fn user_input_request_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -1239,10 +1265,10 @@ pub struct ViewStack {
     /// Theme snapshot for the texture pass, set alongside the mode each
     /// frame. `None` (e.g. tests that never opt in) disables the texture.
     focus_texture_theme: Option<codewhale_palette::UiTheme>,
-    /// When the view now on top became the top view — pushed, or revealed
-    /// by closing or removing the views above it. A key observed before
+    /// When the input context on top became visible — pushed, advanced, or
+    /// revealed by closing or removing the views above it. A key observed before
     /// this instant was typed at something else and must never answer an
-    /// approval or elevation card that only then became visible (approvals M2).
+    /// approval, elevation or question prompt that only then became visible.
     top_since: Option<std::time::Instant>,
 }
 
@@ -1264,16 +1290,19 @@ impl ViewStack {
         }
     }
 
-    /// Identity of the top view, for noticing when a different view becomes
-    /// the top one.
-    fn top_identity(&self) -> Option<*const ()> {
-        self.views
-            .last()
-            .map(|view| std::ptr::from_ref::<dyn ModalView>(view.as_ref()).cast::<()>())
+    /// Identity of the top view and input context, for noticing when a
+    /// different view or question becomes the top one.
+    fn top_identity(&self) -> Option<(*const (), usize)> {
+        self.views.last().map(|view| {
+            (
+                std::ptr::from_ref::<dyn ModalView>(view.as_ref()).cast::<()>(),
+                view.input_context_id(),
+            )
+        })
     }
 
     /// Restamp `top_since` when the top view changed since `before`.
-    fn note_top_change(&mut self, before: Option<*const ()>) {
+    fn note_top_change(&mut self, before: Option<(*const (), usize)>) {
         if self.top_identity() != before {
             self.top_since = Some(std::time::Instant::now());
         }
@@ -1308,38 +1337,71 @@ impl ViewStack {
         self.views.len() != before
     }
 
-    /// Remove the approval card for tool/approval id `id` at any depth.
-    pub fn remove_approval_by_id(&mut self, id: &str) -> bool {
+    /// Remove the initial approval or elevation retry for `id` at any depth.
+    pub fn remove_tool_decision_by_id(&mut self, id: &str) -> bool {
         let before = self.views.len();
         let top = self.top_identity();
         self.views
-            .retain(|view| view.approval_request_id() != Some(id));
+            .retain(|view| view.tool_decision_request_id() != Some(id));
         self.note_top_change(top);
         self.views.len() != before
     }
 
-    /// Whether an approval card for `id` is anywhere in the stack.
+    /// Retire one settled question at any depth without closing other views.
+    pub fn remove_user_input_by_id(&mut self, id: &str) -> bool {
+        let before = self.views.len();
+        let top = self.top_identity();
+        self.views
+            .retain(|view| view.user_input_request_id() != Some(id));
+        self.note_top_change(top);
+        self.views.len() != before
+    }
+
+    /// Whether an initial approval card for `id` is anywhere in the stack.
+    #[cfg(test)]
     pub fn contains_approval_id(&self, id: &str) -> bool {
         self.views
             .iter()
             .any(|view| view.approval_request_id() == Some(id))
     }
 
-    /// The approval id of the top view, when it is an approval card.
+    pub fn contains_tool_decision_id(&self, id: &str) -> bool {
+        self.views
+            .iter()
+            .any(|view| view.tool_decision_request_id() == Some(id))
+    }
+
+    pub fn tool_decision_request_ids(&self) -> Vec<String> {
+        self.views
+            .iter()
+            .filter_map(|view| view.tool_decision_request_id().map(str::to_owned))
+            .collect()
+    }
+
+    /// The initial approval id of the top view, kept distinct in authority tests.
+    #[cfg(test)]
     pub fn top_approval_id(&self) -> Option<&str> {
         self.views
             .last()
             .and_then(|view| view.approval_request_id())
     }
 
+    /// The decision currently shown, including an elevation retry.
+    pub fn top_tool_decision_id(&self) -> Option<&str> {
+        self.views
+            .last()
+            .and_then(|view| view.tool_decision_request_id())
+    }
+
     /// Whether a key observed at `observed_at` predates the moment the
-    /// approval or elevation card on top became visible — raised, or revealed
-    /// by closing the card above it — i.e. it was typed ahead and must not
-    /// answer that card. Two quick answers cannot confirm the card beneath.
+    /// approval, elevation or question prompt on top became visible — raised,
+    /// advanced, or revealed by closing the card above it — i.e. it was typed
+    /// ahead and must not answer that prompt. Two quick answers cannot confirm
+    /// the next prompt.
     pub fn key_predates_top_approval(&self, observed_at: std::time::Instant) -> bool {
         matches!(
             self.top_kind(),
-            Some(ModalKind::Approval | ModalKind::Elevation)
+            Some(ModalKind::Approval | ModalKind::Elevation | ModalKind::UserInput)
         ) && self
             .top_since
             .is_some_and(|top_since| observed_at < top_since)
@@ -1435,11 +1497,13 @@ impl ViewStack {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<ViewEvent> {
+        let top = self.top_identity();
         let action = self
             .views
             .last_mut()
             .map(|view| view.handle_key(key))
             .unwrap_or(ViewAction::None);
+        self.note_top_change(top);
         self.apply_action(action)
     }
 
@@ -1549,6 +1613,13 @@ impl ViewStack {
         {
             panel.refresh_snapshot(snapshot);
         }
+    }
+
+    pub(crate) fn top_pager_mut(&mut self) -> Option<&mut crate::tui::pager::PagerView> {
+        self.views
+            .last_mut()?
+            .as_any_mut()
+            .downcast_mut::<crate::tui::pager::PagerView>()
     }
 }
 
@@ -1832,7 +1903,7 @@ struct SettingMeta {
 
 #[derive(Debug, Clone)]
 struct SettingsRegistry {
-    provider: ApiProvider,
+    provider: ProviderKind,
     base_url: String,
     model: String,
     auto_model: bool,
@@ -1856,7 +1927,7 @@ impl SettingsRegistry {
             &self.model,
             self.auto_model,
         ) {
-            let label = if self.provider == ApiProvider::OpenaiCodex {
+            let label = if self.provider == ProviderKind::OpenaiCodex {
                 effort.display_label_for_provider(self.provider)
             } else {
                 effort.as_setting()
@@ -2141,7 +2212,7 @@ pub struct ConfigView {
     hovered_nav: Option<NavStep>,
     hovered_editor: Option<EditorControl>,
     hovered_choice: Option<usize>,
-    api_provider: ApiProvider,
+    api_provider: ProviderKind,
     route_base_url: String,
     route_model: String,
     auto_model: bool,
@@ -2277,7 +2348,20 @@ impl ConfigView {
             ConfigRow {
                 key: "context_window".to_string(),
                 value: config
-                    .context_window_for_provider_config(active_route_provider)
+                    .active_provider_identity()
+                    .ok()
+                    .filter(|identity| {
+                        // Display names are labels; saved facts require the
+                        // exact provider identity admitted by this App.
+                        app.admitted_provider_identity()
+                            .is_ok_and(|active| active == identity)
+                            && identity.provider == active_route_provider
+                            && (!app.auto_model
+                                || app.last_effective_provider.is_none()
+                                || app.last_effective_provider_identity.as_deref()
+                                    == Some(identity.key.as_str()))
+                    })
+                    .and_then(|identity| config.context_window_for_provider_config(&identity))
                     .map_or_else(|| "(not set)".to_string(), |tokens| tokens.to_string()),
                 editable: false,
                 scope: ConfigScope::Saved,
@@ -2394,6 +2478,13 @@ impl ConfigView {
                 editable: true,
                 scope: ConfigScope::Saved,
                 facts: ConfigRowFacts::saved_setting(),
+            },
+            ConfigRow {
+                key: "pet_mode".to_string(),
+                value: settings.pet_mode.to_string(),
+                editable: true,
+                scope: ConfigScope::Saved,
+                facts: ConfigRowFacts::saved_setting().effective(app.pet_watch.enabled.to_string()),
             },
             ConfigRow {
                 key: "calm_mode".to_string(),
@@ -2724,11 +2815,13 @@ impl ConfigView {
         // has no settings row: it is not a live choice on any provider, and
         // a leftover value is cleared with `/set default_model` instead of
         // a Legacy table section.
-        let external_status_rows = [ApiProvider::OpenaiCodex, ApiProvider::Xai]
+        let external_status_rows = [ProviderKind::OpenaiCodex, ProviderKind::Xai]
             .into_iter()
             .filter_map(|provider| {
                 config
-                    .external_credential_consent_status(provider)
+                    .builtin_provider_identity(provider)
+                    .ok()
+                    .and_then(|identity| config.external_credential_consent_status(&identity))
                     .map(|status| {
                         let state = if status.route_state == "active" {
                             tr(app.ui_locale, MessageId::CtxInspActive)
@@ -3680,8 +3773,8 @@ impl ConfigView {
     }
 }
 
-fn config_base_url_row_key(provider: ApiProvider) -> &'static str {
-    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+fn config_base_url_row_key(provider: ProviderKind) -> &'static str {
+    if matches!(provider, ProviderKind::Deepseek) {
         "base_url"
     } else {
         "provider_url"
@@ -4295,6 +4388,7 @@ impl ModalView for ConfigView {
 
         let inner =
             render_underwater_surface(area, buf, self.tr(MessageId::ConfigModalTitle).to_string());
+        let mut choice_rail = None;
         let (lines, footer) = if let Some(edit) = self.editing.as_ref() {
             *self.last_choice_hitboxes.borrow_mut() = Vec::new();
             *self.last_editor_controls.borrow_mut() = Vec::new();
@@ -4391,6 +4485,21 @@ impl ModalView for ConfigView {
                     .min(max_start);
                 let end = (start + visible_options).min(choices.len());
                 let mut hitboxes = Vec::new();
+                let scrolls = visible_options < choices.len();
+                if scrolls {
+                    choice_rail = Some((
+                        Rect {
+                            x: inner.x,
+                            y: inner.y.saturating_add(lines.len() as u16),
+                            width: inner.width,
+                            height: u16::try_from(visible_options).unwrap_or(u16::MAX),
+                        },
+                        choices.len(),
+                        start,
+                        visible_options,
+                    ));
+                }
+                let label_width = usize::from(inner.width).saturating_sub(8 + usize::from(scrolls));
 
                 for (choice_idx, choice) in choices.iter().enumerate().take(end).skip(start) {
                     let selected = choice_idx == edit.selected_choice;
@@ -4401,7 +4510,7 @@ impl ModalView for ConfigView {
                         Rect {
                             x: inner.x,
                             y: line_y,
-                            width: inner.width,
+                            width: inner.width.saturating_sub(u16::from(scrolls)),
                             height: 1,
                         },
                         choice_idx,
@@ -4409,7 +4518,7 @@ impl ModalView for ConfigView {
                     let mut line = Line::from(format!(
                         "  {marker} {:>2}. {}",
                         choice_idx + 1,
-                        truncate_view_text(&label, usize::from(inner.width).saturating_sub(8))
+                        truncate_view_text(&label, label_width)
                     ));
                     line.style = if selected {
                         menu_style::selected_row_style()
@@ -4475,6 +4584,9 @@ impl ModalView for ConfigView {
             .style(Style::default().fg(palette::TEXT_PRIMARY))
             .scroll((0, 0))
             .render(body, buf);
+        if let Some((rail, total, offset, visible)) = choice_rail {
+            render_panel_scroll_rail(rail, buf, total, offset, visible, true);
+        }
         if content.height > 0 {
             self.render_editor_controls(
                 Rect {
@@ -5228,25 +5340,26 @@ impl ConfigView {
         let context_percent = self.snapshot.context_budget.as_ref().map_or(0, |budget| {
             u8::try_from(budget.percent_basis_points / 100).unwrap_or(100)
         });
-        let mode = value_of("default_mode").unwrap_or_else(|| "agent".to_string());
-        let mode_ink = match mode.as_str() {
-            "plan" => palette::ChromeInk::PolicyPlan,
-            "operate" => palette::ChromeInk::PolicyOperate,
-            _ => palette::ChromeInk::PolicyAct,
-        };
-        let permission = value_of("approval_mode")
+        let mode = value_of("default_mode").map_or(codewhale_config::AppMode::Agent, |value| {
+            codewhale_config::AppMode::from_setting(&value)
+        });
+        let approval = value_of("approval_mode")
             .or_else(|| value_of("permission_posture"))
-            .unwrap_or_else(|| "ask".to_string());
-        let permission_ink = match permission.as_str() {
-            "auto-review" => palette::ChromeInk::PermissionAutoReview,
-            "full-access" => palette::ChromeInk::PermissionFullAccess,
-            _ => palette::ChromeInk::PermissionAsk,
-        };
+            .and_then(|value| codewhale_execpolicy::ApprovalMode::from_config_value(&value))
+            .unwrap_or(codewhale_execpolicy::ApprovalMode::Suggest);
+        let mode_label = crate::tui::underwater::mode_label(self.locale, mode);
+        let permission = crate::core::authority::permission_label_for(self.locale, mode, approval);
         let footer = crate::tui::phase_strip::TidelineFooter::new(
             &theme,
-            (permission.as_str(), permission_ink),
+            (
+                permission.as_ref(),
+                crate::tui::underwater::header_permission_ink(approval),
+            ),
         )
-        .mode_chip(Some((mode.as_str(), mode_ink)))
+        .mode_chip(Some((
+            mode_label.as_ref(),
+            crate::tui::underwater::header_mode_ink(mode),
+        )))
         .context_percent(context_percent);
         crate::tui::phase_strip::render_tideline_footer(
             Rect {
@@ -5907,6 +6020,7 @@ fn live_subagent_result(
         git_branch: None,
         agent_type,
         assignment: SubAgentAssignment {
+            native_preset: None,
             objective: summarize_tool_output(objective),
             role: role.map(str::to_string),
         },
@@ -7394,10 +7508,10 @@ mod tests {
             // tests at a unique absent file so developer or concurrent test
             // settings cannot silently change which controls are editable.
             config_path: Some(isolated_config_path),
-            ..crate::test_support::test_tui_options(PathBuf::from("."))
+            ..crate::tui::test_support::test_tui_options(PathBuf::from("."))
         };
         let mut app = App::new(options, &Config::default());
-        app.api_provider = crate::config::ApiProvider::Deepseek;
+        app.api_provider = crate::config::ProviderKind::Deepseek;
         app
     }
 
@@ -7439,6 +7553,7 @@ mod tests {
             git_branch: None,
             agent_type: FleetRole::Scout,
             assignment: SubAgentAssignment {
+                native_preset: None,
                 objective: "read the docs".to_string(),
                 role: None,
             },
@@ -8184,7 +8299,7 @@ api_key_env = "ACME_API_KEY"
         .expect("custom provider config");
         let mut app = create_test_app();
         app.config_path = Some(config_path);
-        app.set_provider_identity(crate::config::ApiProvider::Custom, "acme_ai");
+        app.set_provider_identity(crate::config::ProviderKind::Custom, "acme_ai");
         let mut view = ConfigView::new_for_app(&app);
         view.focus_key("provider");
 
@@ -8238,7 +8353,7 @@ api_key_env = "ACME_API_KEY"
     fn config_view_zai_model_row_has_no_derived_rows() {
         let _guard = ConfigSettingsEnvGuard::new("");
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Zai;
+        app.api_provider = crate::config::ProviderKind::Zai;
         app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
 
         let view = ConfigView::new_for_app(&app);
@@ -8281,7 +8396,7 @@ api_key_env = "ACME_API_KEY"
         let mut app = create_test_app();
         app.config_path = Some(config_path.clone());
         // Live session route, exactly as a /provider switch would leave it.
-        app.api_provider = crate::config::ApiProvider::Zai;
+        app.api_provider = crate::config::ProviderKind::Zai;
         app.model = "GLM-5.3".to_string();
         app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
 
@@ -8325,11 +8440,11 @@ api_key_env = "ACME_API_KEY"
         let _guard = ConfigSettingsEnvGuard::new("");
         let mut app = create_test_app();
         for provider in [
-            crate::config::ApiProvider::Zai,
-            crate::config::ApiProvider::Xai,
-            crate::config::ApiProvider::Openrouter,
-            crate::config::ApiProvider::Ollama,
-            crate::config::ApiProvider::Deepseek,
+            crate::config::ProviderKind::Zai,
+            crate::config::ProviderKind::Xai,
+            crate::config::ProviderKind::Openrouter,
+            crate::config::ProviderKind::Ollama,
+            crate::config::ProviderKind::Deepseek,
         ] {
             app.api_provider = provider;
             let view = ConfigView::new_for_app(&app);
@@ -8347,7 +8462,7 @@ api_key_env = "ACME_API_KEY"
         // the canonical config selection writer.
         let _guard = ConfigSettingsEnvGuard::new("default_model = \"deepseek-v4-pro\"\n");
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Zai;
+        app.api_provider = crate::config::ProviderKind::Zai;
 
         let view = ConfigView::new_for_app(&app);
         assert!(
@@ -8370,7 +8485,7 @@ api_key_env = "ACME_API_KEY"
     fn config_view_settings_rows_land_in_truthful_sections() {
         let _guard = ConfigSettingsEnvGuard::new("default_model = \"deepseek-v4-pro\"\n");
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::Zai;
+        app.api_provider = crate::config::ProviderKind::Zai;
         let view = ConfigView::new_for_app(&app);
 
         let section_of = |key: &str| {
@@ -8429,7 +8544,7 @@ api_key_env = "ACME_API_KEY"
             .iter()
             .find(|row| row.section() == super::ConfigSection::Workflow)
             .expect("workflow row");
-        assert_eq!(workflow.key, "workflow");
+        assert_eq!(workflow.key.as_str(), "workflow");
         assert!(workflow.value.starts_with("/workflow "), "{workflow:?}");
         assert_eq!(config_label_for_key("workflow"), "Workflow");
     }
@@ -8585,7 +8700,7 @@ base_url = "https://api.xiaomimimo.com/v1"
         .unwrap();
 
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::XiaomiMimo;
+        app.api_provider = crate::config::ProviderKind::XiaomiMimo;
         app.active_route_base_url = crate::config::DEFAULT_XIAOMI_MIMO_BASE_URL.to_string();
         app.ui_locale = Locale::Es419;
         app.config_path = Some(config_path.clone());
@@ -9150,6 +9265,36 @@ base_url = "https://api.xiaomimimo.com/v1"
     /// string in every shipped locale. `tr_key` returns the key itself when a
     /// pack is missing the entry, so this fails fast on a stale binding.
     #[test]
+    fn pet_mode_setting_shows_saved_and_live_choices_and_emits_the_existing_commit_event() {
+        let _guard = ConfigSettingsEnvGuard::new("pet_mode = false\n");
+        let mut app = create_test_app();
+        app.pet_watch.enabled = true;
+        let mut view = ConfigView::new_for_app(&app);
+        let row = view
+            .rows
+            .iter()
+            .find(|row| row.key == "pet_mode")
+            .expect("pet view setting");
+        assert_eq!(row.value, "false");
+        assert_eq!(row.facts.effective.as_deref(), Some("true"));
+        assert!(row.editable);
+        assert_eq!(row.ui().unwrap().label, "ConfigLabelPetMode");
+        view.focus_key("pet_mode");
+        view.start_edit();
+        let edit = view.editing.as_mut().expect("pet mode editor");
+        edit.selected_choice = edit
+            .choices
+            .as_ref()
+            .unwrap()
+            .iter()
+            .position(|value| value == "true")
+            .unwrap();
+        assert!(
+            matches!(view.handle_choice_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), ViewAction::Emit(ViewEvent::ConfigUpdated { key, value, persist: true }) if key == "pet_mode" && value == "true")
+        );
+    }
+
+    #[test]
     fn settings_schema_message_keys_are_localized() {
         let mut keys: Vec<&'static str> = Vec::new();
         for def in codewhale_config::SETTINGS_SCHEMA {
@@ -9192,6 +9337,7 @@ base_url = "https://api.xiaomimimo.com/v1"
 
     #[test]
     fn config_view_exposes_configured_and_effective_context_window() {
+        let _env = crate::test_support::lock_test_env();
         let temp = tempfile::tempdir().expect("config fixture");
         let config_path = temp.path().join("config.toml");
         std::fs::write(
@@ -9204,9 +9350,23 @@ context_window = 262144
 "#,
         )
         .expect("config");
-        let mut app = create_test_app();
-        app.config_path = Some(config_path);
-        app.api_provider = crate::config::ApiProvider::Moonshot;
+        let _config_path =
+            crate::test_support::EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+        let config =
+            Config::load(Some(config_path.clone()), None).expect("captured fixture config");
+        let options = TuiOptions {
+            config_path: Some(config_path),
+            ..crate::tui::test_support::test_tui_options(temp.path())
+        };
+        let mut app = App::new(options, &config);
+        let identity = config
+            .active_provider_identity()
+            .expect("captured fixture provider");
+        assert_eq!(
+            config.context_window_for_provider_config(&identity),
+            Some(262_144)
+        );
+        app.set_provider_identity_record(identity);
         app.model = "kimi-k3".to_string();
         app.active_route_limits = Some(codewhale_config::route::RouteLimits {
             context_tokens: Some(262_144),
@@ -9228,13 +9388,104 @@ context_window = 262144
 
         assert_eq!(configured.value, "262144");
         assert_eq!(effective.value, "262144 tokens · configured");
+
+        app.auto_model = true;
+        app.last_effective_provider = Some(app.api_provider);
+        app.last_effective_provider_identity = Some("other-moonshot".to_string());
+        let automatic_view = ConfigView::new_for_app(&app);
+        let configured = automatic_view
+            .rows
+            .iter()
+            .find(|row| row.key == "context_window")
+            .expect("automatic configured context row");
+        assert_eq!(configured.value, "(not set)");
+        app.pending_turn_route = Some((app.api_provider, "kimi-k3".to_string(), true));
+        let pending_view = ConfigView::new_for_app(&app);
+        let configured = pending_view
+            .rows
+            .iter()
+            .find(|row| row.key == "context_window")
+            .expect("pending foreign configured context row");
+        assert_eq!(configured.value, "(not set)");
+        app.pending_turn_route = None;
+        app.auto_model = false;
+
+        // Same provider kind is insufficient when a different owned table is
+        // selected. The saved row must not borrow another table's limit.
+        let saved_path = PathBuf::from(
+            std::env::var_os("DEEPSEEK_CONFIG_PATH").expect("isolated saved config path"),
+        );
+        std::fs::write(
+            &saved_path,
+            r#"
+provider = "custom-current"
+[providers.custom-current]
+kind = "openai-compatible"
+base_url = "https://current.example.invalid/v1"
+model = "fixture-model"
+context_window = 131072
+"#,
+        )
+        .expect("saved custom provider");
+        let saved = Config::load(Some(saved_path.clone()), None).expect("saved custom config");
+        let saved_identity = saved
+            .active_provider_identity()
+            .expect("saved admitted custom identity");
+        assert_eq!(saved_identity.provider, crate::config::ProviderKind::Custom);
+        assert_eq!(saved_identity.key.as_str(), "custom-current");
+        assert_eq!(
+            saved.context_window_for_provider_config(&saved_identity),
+            Some(131_072)
+        );
+        let options = TuiOptions {
+            config_path: Some(saved_path),
+            ..crate::tui::test_support::test_tui_options(temp.path())
+        };
+        let mut app = App::new(options, &saved);
+        app.set_provider_identity_record(saved_identity.clone());
+        let saved_view = ConfigView::new_for_app(&app);
+        let configured = saved_view
+            .rows
+            .iter()
+            .find(|row| row.key == "context_window")
+            .expect("saved custom configured context row");
+        assert_eq!(configured.value, "131072");
+        let foreign: Config = toml::from_str(
+            r#"
+provider = "custom-other"
+[providers.custom-other]
+kind = "openai-compatible"
+base_url = "https://other.example.invalid/v1"
+model = "fixture-model"
+context_window = 131072
+"#,
+        )
+        .expect("foreign configured provider");
+        let foreign_identity = foreign
+            .active_provider_identity()
+            .expect("foreign admitted provider identity");
+        assert_eq!(
+            foreign_identity.provider,
+            crate::config::ProviderKind::Custom
+        );
+        assert_eq!(foreign_identity.provider, app.api_provider);
+        assert_eq!(foreign_identity.key.as_str(), "custom-other");
+        assert_ne!(foreign_identity.key, saved_identity.key);
+        app.set_provider_identity_record(foreign_identity);
+        let foreign_view = ConfigView::new_for_app(&app);
+        let configured = foreign_view
+            .rows
+            .iter()
+            .find(|row| row.key == "context_window")
+            .expect("foreign configured context row");
+        assert_eq!(configured.value, "(not set)");
     }
 
     #[test]
     fn config_view_displays_saved_codex_reasoning_effort_label() {
         let _guard = ConfigSettingsEnvGuard::new("reasoning_effort = \"max\"\n");
         let mut app = create_test_app();
-        app.api_provider = crate::config::ApiProvider::OpenaiCodex;
+        app.api_provider = crate::config::ProviderKind::OpenaiCodex;
 
         let view = ConfigView::new_for_app(&app);
         let row = view
@@ -9634,7 +9885,7 @@ context_window = 262144
         let mut rejected = ConfigView::rebuild_preserving(&app, &view, "mcp_config_path");
         rejected.restore_rejected_commit(&view);
         let edit = rejected.editing.as_ref().expect("a rejected value reopens");
-        assert_eq!(edit.key, "mcp_config_path");
+        assert_eq!(edit.key.as_str(), "mcp_config_path");
         assert_eq!(edit.buffer.iter().collect::<String>(), "servers.json");
     }
 

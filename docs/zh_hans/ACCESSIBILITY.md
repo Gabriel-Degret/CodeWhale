@@ -35,8 +35,9 @@ Codewhale 运行在终端里，所以平台自带的无障碍栈（屏幕阅读�
 * **按主题**，一个审计（`theme_contrast_violations`）要求每个可选预设都守住
   同样的下限：正文、soft 和 muted 文本在每个主表面上都达到 4.5:1（包括选中
   和错误表面）；提示文本和弱化文本为 3:1；状态、警告、成功和信息角色为 3:1，
-  因为它们本就冗余——每个状态还带一个字形和一个文字标签，颜色从不是唯一的
-  通道。diff 的前景/背景对要求 3:1。
+  因为它们本就冗余——每个状态都带一个字形，除成功结束的 shell 命令外，每种
+  状态还带一个文字标签（那张卡片的 `✓`，ASCII 下为 `Y`，单独出现），颜色从不是
+  唯一的通道。diff 的前景/背景对要求 3:1。
 * **Terminal**（透明）主题按设计豁免：它绘制 `Color::Reset` 表面和 ANSI 强调色，
   让宿主终端自己的配色透出来。这些颜色归终端所有，无法测量，所以审计跳过它们，
   而不是宣称它们通过了检查（`theme_uses_terminal_owned_surfaces` 把这项豁免写明）。
@@ -97,12 +98,12 @@ Tilix 和 Terminator 的会话会自动以低动效模式启动，因为这类�
   无障碍服务的终端（例如 macOS Terminal.app、iTerm2、Ghostty、Windows Terminal）
   都会把渲染后的内容原样透传。
 * 如果 `low_motion = true` 时仍有界面元素产生动效，请针对
-  [`PRIOR: Screen-reader / accessibility flag`](https://github.com/Hmbown/CodeWhale/issues/450)
+  [`PRIOR: Screen-reader / accessibility flag`](https://github.com/codewhale-hq/CodeWhale/issues/450)
   提一个 issue，并附上截图或终端录制。
 
 ## 相关 issue / 历史
 
-* [#450](https://github.com/Hmbown/CodeWhale/issues/450) ——
+* [#450](https://github.com/codewhale-hq/CodeWhale/issues/450) ——
   记录已有的开关，加入 `NO_ANIMATIONS` 启动覆盖，并撰写本页。
-* [#449](https://github.com/Hmbown/CodeWhale/issues/449) ——
+* [#449](https://github.com/codewhale-hq/CodeWhale/issues/449) ——
   页脚状态栏现在使用当前主题的对比配色对，而不再用单独定制的调色板。

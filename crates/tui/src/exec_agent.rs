@@ -297,7 +297,6 @@ pub(crate) async fn run_exec_agent(
     auto_approve: bool,
     allow_sandbox_elevation: bool,
     explicit_sandbox: Option<&str>,
-    trust_mode: bool,
     json_output: bool,
     resume_session: Option<session_manager::SavedSession>,
     force_configured_route: bool,
@@ -378,20 +377,24 @@ pub(crate) async fn run_exec_agent(
     };
 
     let route = resolve_cli_exec_route(config, model, prompt, force_configured_route).await?;
-    let execution_config = config_for_cli_route(config, &route);
+    let execution_config = config_for_cli_route(config, &route)?;
+    crate::provider_lake::refresh_account_catalog_before_first_request(&execution_config).await;
     let auto_model = route.auto_model;
-    let effective_provider = route.provider;
+    let effective_identity = execution_config
+        .active_provider_identity()
+        .map_err(anyhow::Error::msg)?;
+    let effective_provider = effective_identity.provider;
     let effective_model = route.model;
-    let validated_route = crate::route_runtime::resolve_runtime_route(
+    let validated_route = crate::route_runtime::resolve_runtime_route_for_identity(
         &execution_config,
-        effective_provider,
+        &effective_identity,
         Some(&effective_model),
     )
     .map_err(anyhow::Error::msg)?
     .validate_for(crate::route_runtime::RouteErrorSurface::Headless)
     .map_err(anyhow::Error::msg)?;
-    let effective_provider_name = validated_route.identity.key.clone();
-    let effective_provider_id = validated_route.identity.exact_id.clone();
+    let effective_identity = validated_route.identity.clone();
+    let effective_provider_name = effective_identity.key.to_string();
     let (effective_provider_kind, effective_stream_provider_id) =
         exec_stream_provider_route(&validated_route.identity);
     let route_source = if auto_model {
@@ -404,13 +407,42 @@ pub(crate) async fn run_exec_agent(
     let prompt_sha256 = format!("sha256:{}", crate::hashing::sha256_hex(prompt.as_bytes()));
     let binary_sha256 = current_binary_sha256();
     let approval_posture = if auto_approve { "auto_tools" } else { "ask" }.to_string();
-    let sandbox_posture = explicit_sandbox.unwrap_or("configured_default").to_string();
+    // The Full Access posture travels in the op's auto_approve/approval_mode
+    // fields; modes no longer carry permission.
+    let mode = AppMode::Agent;
+    let turn_approval_mode = if auto_approve {
+        ApprovalMode::Bypass
+    } else {
+        execution_config
+            .approval_policy
+            .as_deref()
+            .and_then(ApprovalMode::from_config_value)
+            .unwrap_or_default()
+    };
+    let turn_sandbox_policy = crate::core::authority::sandbox_policy_for_turn(
+        mode,
+        turn_approval_mode,
+        execution_config.sandbox_mode.as_deref(),
+        &workspace,
+        crate::core::authority::SandboxNetworkAccess::from_config(
+            execution_config.sandbox_network_access,
+        ),
+    );
+    let trust_mode = auto_approve
+        && matches!(
+            turn_sandbox_policy,
+            crate::sandbox::SandboxPolicy::DangerFullAccess
+        );
     let active_route_limits =
         crate::route_budget::known_route_limits(validated_route.candidate.limits());
-    let max_subagents = if max_subagents == config.max_subagents_for_provider(config.api_provider())
-    {
+    let max_subagents = if max_subagents
+        == config.max_subagents_for_provider(
+            &config
+                .active_provider_identity()
+                .map_err(anyhow::Error::msg)?,
+        ) {
         execution_config
-            .max_subagents_for_provider(effective_provider)
+            .max_subagents_for_provider(&effective_identity)
             .clamp(1, MAX_SUBAGENTS)
     } else {
         max_subagents
@@ -528,7 +560,14 @@ pub(crate) async fn run_exec_agent(
         model: effective_model.clone(),
         active_route_limits,
         workspace: workspace.clone(),
-        session_id: fleet_capture.as_ref().map(|(id, _)| id.clone()),
+        session_id: fleet_capture
+            .as_ref()
+            .map(|(id, _)| id.clone())
+            .or_else(|| {
+                resume_session
+                    .as_ref()
+                    .map(|saved| saved.metadata.id.clone())
+            }),
         subagent_state_root: None,
         plugin_registry: Some(std::sync::Arc::clone(&engine_plugin_registry)),
         allow_shell: exec_allow_shell,
@@ -562,11 +601,11 @@ pub(crate) async fn run_exec_agent(
         max_steps: max_turns,
         max_subagents,
         max_admitted_subagents: execution_config
-            .max_admitted_subagents_for_provider(effective_provider)
+            .max_admitted_subagents_for_provider(&effective_identity)
             .max(max_subagents),
-        launch_concurrency: execution_config.launch_concurrency_for_provider(effective_provider),
+        launch_concurrency: execution_config.launch_concurrency_for_provider(&effective_identity),
         subagents_enabled: !fleet_authority_active
-            && execution_config.subagents_enabled_for_provider(effective_provider),
+            && execution_config.subagents_enabled_for_provider(&effective_identity),
         features: engine_features,
         auto_review_policy: execution_config.auto_review_policy(),
         compaction: compaction.clone(),
@@ -576,7 +615,7 @@ pub(crate) async fn run_exec_agent(
         max_spawn_depth: if fleet_authority_active {
             0
         } else {
-            execution_config.subagent_max_spawn_depth_for_provider(effective_provider)
+            execution_config.subagent_max_spawn_depth_for_provider(&effective_identity)
         },
         network_policy,
         snapshots_enabled: !fleet_authority_active
@@ -597,7 +636,7 @@ pub(crate) async fn run_exec_agent(
             Some(engine_plugin_registry.as_ref()),
         )),
         subagent_api_timeout: std::time::Duration::from_secs(
-            execution_config.subagent_api_timeout_secs_for_provider(effective_provider),
+            execution_config.subagent_api_timeout_secs_for_provider(&effective_identity),
         ),
         stream_chunk_timeout: std::time::Duration::from_secs(
             execution_config.stream_chunk_timeout_secs(),
@@ -608,9 +647,9 @@ pub(crate) async fn run_exec_agent(
         stream_retry_limits: execution_config.stream_retry_limits(),
         stream_open_timeout: execution_config.stream_open_timeout(),
         subagent_heartbeat_timeout: std::time::Duration::from_secs(
-            execution_config.subagent_heartbeat_timeout_secs_for_provider(effective_provider),
+            execution_config.subagent_heartbeat_timeout_secs_for_provider(&effective_identity),
         ),
-        prefer_bwrap: execution_config.prefer_bwrap.unwrap_or(false),
+        prefer_bwrap: execution_config.prefers_bwrap(),
         bwrap_extensions: crate::sandbox::BwrapMountExtensions {
             read_only_roots: execution_config.bwrap_ro_roots.clone(),
             device_roots: execution_config.bwrap_dev_roots.clone(),
@@ -680,16 +719,32 @@ pub(crate) async fn run_exec_agent(
             .unwrap_or_else(crate::tools::subagent::AdvisorConfig::disabled),
     };
 
-    let engine_handle = spawn_engine(engine_config, &execution_config);
-    // The Full Access posture travels in the op's auto_approve/approval_mode
-    // fields; modes no longer carry permission.
-    let mode = AppMode::Agent;
+    let engine_handle = spawn_engine(engine_config, &execution_config, None);
+    // A restricted posture that resolves to no enforcing sandbox must reach
+    // the person running exec, not only the model's posture line: policy-only
+    // is accepted (read-only already fails closed in the shell tool), but it
+    // is never silent. Uses the enforcement pinned by `Engine::new`.
+    let sandbox_enforcement = engine_handle.sandbox_enforcement;
+    let sandbox_posture = turn_sandbox_policy.posture_label_with_enforcement(sandbox_enforcement);
+    if sandbox_enforcement == crate::sandbox::policy::SandboxEnforcement::Unavailable
+        && turn_sandbox_policy.should_sandbox()
+    {
+        eprintln!("warning: {sandbox_posture} — shell commands will run unrestricted");
+    }
 
     let resuming_session = resume_session.is_some();
     let mut loaded_session_id = None;
     if let Some(saved) = resume_session {
         let saved_id = saved.metadata.id.clone();
-        if saved.metadata.workspace != workspace && output_format == ExecOutputFormat::Text {
+        let saved_workspace = tokio::fs::canonicalize(&saved.metadata.workspace)
+            .await
+            .unwrap_or_else(|_| saved.metadata.workspace.clone());
+        let launch_workspace = tokio::fs::canonicalize(&workspace)
+            .await
+            .unwrap_or_else(|_| workspace.clone());
+        if !paths_equal_for_config(&saved_workspace, &launch_workspace)
+            && output_format == ExecOutputFormat::Text
+        {
             eprintln!(
                 "Warning: session {} was created in a different workspace ({}). Resuming anyway.",
                 truncate_id(&saved_id),
@@ -735,6 +790,7 @@ pub(crate) async fn run_exec_agent(
 
     engine_handle
         .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
             max_output_tokens: None,
             content: prompt.to_string(),
             images: Vec::new(),
@@ -755,15 +811,7 @@ pub(crate) async fn run_exec_agent(
             trust_mode,
             auto_approve,
             translation_enabled: false,
-            approval_mode: if auto_approve {
-                ApprovalMode::Bypass
-            } else {
-                execution_config
-                    .approval_policy
-                    .as_deref()
-                    .and_then(ApprovalMode::from_config_value)
-                    .unwrap_or_default()
-            },
+            approval_mode: turn_approval_mode,
             verbosity: execution_config.verbosity.clone(),
             provenance: crate::core::ops::UserInputProvenance::ExternalUser,
             // Headless exec does not correlate submissions.
@@ -805,7 +853,7 @@ pub(crate) async fn run_exec_agent(
     let mut reported_sandbox_contract = false;
 
     let mut should_persist_session =
-        resuming_session || output_format == ExecOutputFormat::StreamJson;
+        !one_shot || resuming_session || output_format == ExecOutputFormat::StreamJson;
     let mut latest_session_id = loaded_session_id;
     let mut latest_messages: Arc<Vec<Message>> = Arc::new(Vec::new());
     let mut latest_system_prompt: Option<SystemPrompt> = None;
@@ -813,6 +861,9 @@ pub(crate) async fn run_exec_agent(
     let mut latest_workspace = workspace.clone();
     let mut tool_starts: HashMap<String, (Instant, String)> = HashMap::new();
     let mut turn_usage_seq: u32 = 0;
+    // None means no actual terminal request snapshot was observed. A known
+    // zero must remain distinguishable from that missing receipt.
+    let mut observed_retry_count = None;
     let mut settled_usage: Option<codewhale_models::Usage> = None;
 
     let mut ends_with_newline = false;
@@ -863,6 +914,29 @@ pub(crate) async fn run_exec_agent(
                         omitted_tool_count,
                     )
                 );
+            }
+            Event::RequestImageWindow {
+                provider,
+                model,
+                total,
+                elided,
+                cap,
+                cap_source,
+                message,
+            } => {
+                if output_format == ExecOutputFormat::StreamJson {
+                    emit_exec_stream_event(&ExecStreamEvent::RequestImageWindow {
+                        provider,
+                        model,
+                        total,
+                        elided,
+                        cap,
+                        cap_source,
+                        message,
+                    })?;
+                } else if !json_output {
+                    eprintln!("{message}");
+                }
             }
             Event::ToolCallStarted {
                 id, name, input, ..
@@ -1038,8 +1112,14 @@ pub(crate) async fn run_exec_agent(
             }
             // Headless runs have no person at the prompt: the run's flags
             // (the posture) answer every request.
-            Event::ApprovalRequired { id, .. } => {
-                if auto_approve {
+            Event::ApprovalRequired {
+                id,
+                approval_force_prompt,
+                ..
+            } => {
+                // An exact user decision (including extension-sourced shell
+                // and network calls) cannot be supplied by a headless posture.
+                if auto_approve && !approval_force_prompt {
                     let _ = engine_handle
                         .approve_tool_call_by(id, crate::approval_log::ApprovalDecider::Posture)
                         .await;
@@ -1117,8 +1197,16 @@ pub(crate) async fn run_exec_agent(
                     eprintln!("error: {}", envelope.message);
                 }
             }
+            Event::ProviderRequestReceipt { receipt } => {
+                if output_format == ExecOutputFormat::StreamJson {
+                    emit_exec_stream_event(&ExecStreamEvent::ProviderRequestReceipt { receipt })?;
+                }
+            }
             Event::TurnUsage {
-                usage, duration_ms, ..
+                usage,
+                duration_ms,
+                finish_reason,
+                ..
             } => {
                 if output_format == ExecOutputFormat::StreamJson {
                     turn_usage_seq = turn_usage_seq.saturating_add(1);
@@ -1132,6 +1220,7 @@ pub(crate) async fn run_exec_agent(
                         prompt_cache_write_tokens: usage.prompt_cache_write_tokens,
                         reasoning_replay_tokens: usage.reasoning_replay_tokens,
                         duration_ms,
+                        finish_reason,
                     })?;
                 }
             }
@@ -1142,10 +1231,11 @@ pub(crate) async fn run_exec_agent(
                 tool_catalog,
                 ..
             } => {
-                let (terminal_status, terminal_error) = (status, error);
-                settled_usage = Some(usage.clone());
+                let mut terminal_status = status;
+                let terminal_error = error;
                 #[cfg(unix)]
-                let (mut terminal_status, mut terminal_error) = (terminal_status, terminal_error);
+                let mut terminal_error = terminal_error;
+                settled_usage = Some(usage.clone());
                 if matches!(
                     terminal_status,
                     crate::core::events::TurnOutcomeStatus::Completed
@@ -1212,9 +1302,69 @@ pub(crate) async fn run_exec_agent(
                             .to_string(),
                     );
                 }
+                if last_error_category.is_none() {
+                    last_error_category = summary
+                        .error
+                        .as_deref()
+                        .map(crate::error_taxonomy::classify_error_message);
+                    summary.error_category =
+                        last_error_category.map(|category| category.to_string());
+                }
+                let saved_session_id = if should_persist_session && !latest_messages.is_empty() {
+                    match persist_exec_session(
+                        &latest_messages,
+                        &latest_model,
+                        PersistedProviderRoute {
+                            kind: effective_identity.persisted_kind(),
+                            id: effective_identity.persisted_id(),
+                        },
+                        &latest_workspace,
+                        &latest_system_prompt,
+                        latest_session_id.as_deref(),
+                        u64::from(usage.input_tokens) + u64::from(usage.output_tokens),
+                        (terminal_status == crate::core::events::TurnOutcomeStatus::Failed)
+                            .then_some(summary.error.as_deref().unwrap_or_else(|| {
+                                crate::core::termination::classify_turn_termination(
+                                    terminal_status,
+                                    last_error_category,
+                                    tool_error_seen,
+                                    approval_required,
+                                )
+                                .as_str()
+                            })),
+                        fleet_capture.as_ref().map(|(_, manager)| manager),
+                    ) {
+                        Ok(id) => {
+                            if output_format == ExecOutputFormat::Text && !json_output {
+                                eprintln!("{}", exec_saved_session_line(&id));
+                            }
+                            Some(id)
+                        }
+                        Err(err) => {
+                            let error = format!(
+                                "Failed to save exec session: {err:#}. The task may already have run; do not retry automatically."
+                            );
+                            terminal_status = crate::core::events::TurnOutcomeStatus::Failed;
+                            summary.status = Some("failed".to_string());
+                            summary.error = Some(match summary.error.take() {
+                                Some(previous) => format!("{previous}; {error}"),
+                                None => error.clone(),
+                            });
+                            last_error_category = Some(crate::error_taxonomy::ErrorCategory::State);
+                            summary.error_category =
+                                last_error_category.map(|category| category.to_string());
+                            if output_format == ExecOutputFormat::StreamJson {
+                                emit_exec_stream_event(&ExecStreamEvent::Error { error })?;
+                            }
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 // Lifecycle outbox: the clean headless turn-end boundary.
-                // `terminal_status` is authoritative here — persistent-service
-                // handoff failures above already demoted it to Failed, and
+                // `terminal_status` includes persistent-service handoff and
+                // session-save failures above, and
                 // `summary.error` includes the sandbox-denial augmentation.
                 // No-op when the feature is disabled.
                 {
@@ -1243,14 +1393,6 @@ pub(crate) async fn run_exec_agent(
                         }),
                     });
                 }
-                if last_error_category.is_none() {
-                    last_error_category = summary
-                        .error
-                        .as_deref()
-                        .map(crate::error_taxonomy::classify_error_message);
-                    summary.error_category =
-                        last_error_category.map(|category| category.to_string());
-                }
                 let termination_reason = crate::core::termination::classify_turn_termination(
                     terminal_status,
                     last_error_category,
@@ -1266,36 +1408,6 @@ pub(crate) async fn run_exec_agent(
                 if !termination_reason.is_success() {
                     codewhale_telemetry::set_exit_class(codewhale_telemetry::ExitClass::Error);
                 }
-                let saved_session_id = if should_persist_session && !latest_messages.is_empty() {
-                    match persist_exec_session(
-                        &latest_messages,
-                        &latest_model,
-                        PersistedProviderRoute {
-                            kind: effective_provider.as_str(),
-                            id: effective_provider_id.as_deref(),
-                        },
-                        &latest_workspace,
-                        &latest_system_prompt,
-                        latest_session_id.as_deref(),
-                        u64::from(usage.input_tokens) + u64::from(usage.output_tokens),
-                        fleet_capture.as_ref().map(|(_, manager)| manager),
-                    ) {
-                        Ok(id) => {
-                            if output_format == ExecOutputFormat::Text && !json_output {
-                                eprintln!("{}", exec_saved_session_line(&id));
-                            }
-                            Some(id)
-                        }
-                        Err(err) => {
-                            if output_format == ExecOutputFormat::Text && !json_output {
-                                eprintln!("warning: failed to save exec session: {err}");
-                            }
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
                 if output_format == ExecOutputFormat::StreamJson {
                     if let Some(id) = saved_session_id.as_ref() {
                         emit_exec_stream_event(&ExecStreamEvent::SessionCapture {
@@ -1346,7 +1458,7 @@ pub(crate) async fn run_exec_agent(
                             ),
                             duration_ms: u64::try_from(exec_started.elapsed().as_millis())
                                 .unwrap_or(u64::MAX),
-                            retry_count: None,
+                            retry_count: observed_retry_count,
                             approval_posture: approval_posture.clone(),
                             sandbox_posture: sandbox_posture.clone(),
                             binary_sha256: binary_sha256.clone(),
@@ -1423,6 +1535,19 @@ pub(crate) async fn run_exec_agent(
                     && message.contains("Maximum model steps") =>
             {
                 eprintln!("{message}");
+            }
+            Event::ToolRequestSnapshot { snapshot } => {
+                observed_retry_count =
+                    accumulate_exec_retry_count(observed_retry_count, snapshot.terminal.as_ref());
+            }
+            Event::Status { message } => {
+                if let Some(receipt) = exec_retry_status(&message) {
+                    if output_format == ExecOutputFormat::StreamJson {
+                        emit_exec_stream_event(&receipt)?;
+                    } else if output_format == ExecOutputFormat::Text && !json_output {
+                        eprintln!("{message}");
+                    }
+                }
             }
             _ => {}
         }
@@ -1517,6 +1642,28 @@ pub(crate) async fn run_exec_agent(
     Ok(())
 }
 
+fn exec_retry_status(message: &str) -> Option<ExecStreamEvent> {
+    crate::core::events::is_retry_status_receipt(message).then(|| ExecStreamEvent::Status {
+        message: message.to_string(),
+    })
+}
+
+fn accumulate_exec_retry_count(
+    previous: Option<u32>,
+    terminal: Option<&crate::tool_inspection::TurnStopDiagnostics>,
+) -> Option<u32> {
+    let Some(terminal) = terminal.filter(|facts| facts.status.is_some()) else {
+        return previous;
+    };
+    let retries = terminal
+        .transport_retries
+        .saturating_add(terminal.transparent_stream_retries)
+        .saturating_add(terminal.stream_resumes)
+        .saturating_add(terminal.empty_stop_retries)
+        .saturating_add(terminal.reasoning_only_reprompts);
+    Some(previous.unwrap_or(0).saturating_add(retries))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ExecAgentEvents, exec_automation_services, exec_disallowed_tools};
@@ -1534,6 +1681,9 @@ mod tests {
             ..Usage::default()
         };
         Event::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: usage.clone(),
             parent_route_usage: usage,
             routed_usage_dropped_records: 0,
@@ -1839,6 +1989,61 @@ mod tests {
         assert!(
             format!("{err:#}").contains("automation store for headless exec"),
             "the failure must name what could not be opened: {err:#}"
+        );
+    }
+
+    #[test]
+    fn exec_retry_receipts_keep_the_existing_jsonl_schema_and_text() {
+        for message in [
+            "Retry attempt: transport 1/2; upstream 503; waiting 0.00s",
+            "Retry recovery: transport request recovered after 1 retries",
+            "Retry exhaustion: stream-resume stopped after 2 retries; stream interrupted",
+            "Retry stopped: transparent stream completion was not observed",
+        ] {
+            let event = super::exec_retry_status(message).expect("retry-only projection");
+            let value = crate::exec_stream_value(&event).unwrap();
+            assert_eq!(value["type"], "status");
+            assert_eq!(value["message"], message);
+            assert_eq!(value["schema"], "codewhale.exec-stream");
+            assert_eq!(value["schema_version"], 1);
+        }
+        assert!(super::exec_retry_status("Executing tools sequentially").is_none());
+        assert!(super::exec_retry_status("Goal set; starting goal work.").is_none());
+    }
+
+    #[test]
+    fn exec_retry_count_requires_terminal_facts_and_keeps_unknown_distinct_from_zero() {
+        use crate::tool_inspection::TurnStopDiagnostics;
+        assert_eq!(super::accumulate_exec_retry_count(None, None), None);
+        assert_eq!(
+            super::accumulate_exec_retry_count(None, Some(&TurnStopDiagnostics::default())),
+            None
+        );
+        let zero = TurnStopDiagnostics {
+            status: Some(TurnOutcomeStatus::Completed),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::accumulate_exec_retry_count(None, Some(&zero)),
+            Some(0)
+        );
+        let retries = TurnStopDiagnostics {
+            status: Some(TurnOutcomeStatus::Failed),
+            transport_retries: 2,
+            stream_resumes: 3,
+            transparent_stream_retries: 1,
+            empty_stop_retries: 1,
+            reasoning_only_reprompts: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::accumulate_exec_retry_count(Some(0), Some(&retries)),
+            Some(9)
+        );
+        assert_eq!(super::accumulate_exec_retry_count(Some(9), None), Some(9));
+        assert_eq!(
+            super::accumulate_exec_retry_count(Some(u32::MAX), Some(&retries)),
+            Some(u32::MAX)
         );
     }
 }

@@ -5,6 +5,8 @@
 //! `codewhale-tui` one command group at a time. Only after every group uses
 //! these shapes will groups move physically into a commands crate.
 
+pub use crate::config_policy::{CommandConfigStatusContext, CommandPermissionsContext};
+
 use std::path::{Path, PathBuf};
 
 mod session_structcopy;
@@ -70,6 +72,27 @@ pub trait CommandModePolicyContext {
     fn allow_shell(&self) -> bool;
     fn set_shell_access(&mut self, allow: bool);
     fn policy_locked(&self) -> bool;
+    /// Apply a mode selection the way `/mode` does, reporting which of the
+    /// three outcomes occurred (changed, same-but-persisted, refused).
+    fn select_mode(&mut self, mode: CommandMode) -> CommandModeSelection;
+    /// Apply the legacy YOLO alias (invisible Act + full access).
+    fn select_yolo_compat(&mut self) -> CommandModeSelection;
+    /// The receipt shown when the same mode was persisted as the default.
+    fn mode_startup_default_receipt(&self, mode: CommandMode) -> String;
+    /// The refusal text when a locked policy blocks the change.
+    fn setting_locked_mode_message(&self) -> String;
+    /// Localized display name for a mode (e.g. `Work`, `Plan`).
+    fn mode_label(&self, mode: CommandMode) -> String;
+    /// Localized label for the legacy YOLO alias (`Full Access (Work)`).
+    fn yolo_compat_label(&self) -> String;
+}
+
+/// Outcome of a `/mode` selection (mirrors the host `SettingSelection`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandModeSelection {
+    Changed,
+    PersistedSame,
+    Refused,
 }
 
 /// Read access to the effective system prompt.
@@ -84,9 +107,17 @@ pub trait CommandSkillsContext {
     fn refresh_skill_cache(&mut self);
 }
 
-/// Workspace path and a bounded serialized work-state snapshot.
+/// Workspace path, bounded work-state observations and confined anchor storage.
 pub trait CommandWorkspaceContext {
     fn workspace(&self) -> PathBuf;
+    fn effective_home_dir(&self) -> Option<PathBuf>;
+    fn inspect_workspace_target(&self, candidate: &Path) -> crate::navigation::WorkspaceTarget;
+    fn read_anchor_document(&self) -> Result<Option<String>, String>;
+    fn append_anchor_bytes(
+        &mut self,
+        parts: &[&[u8]],
+    ) -> Result<PathBuf, crate::navigation::AnchorWriteError>;
+    fn replace_anchor_document(&mut self, bytes: &[u8]) -> Result<(), String>;
     fn work_state_snapshot(&self) -> Result<Option<String>, String>;
     /// Session-aware canonical operation digest. Returns the final user-facing
     /// digest text or a safe explicit error; never a serialized snapshot.
@@ -105,6 +136,10 @@ pub trait CommandWorkspaceContext {
 pub trait CommandPresentationContext {
     /// Resolve a stable message key with its named replacements.
     fn translate(&self, key: &str, replacements: &[(&str, &str)]) -> Result<String, String>;
+
+    fn language_name(&self) -> &'static str {
+        "English"
+    }
 }
 
 /// Portable receipt for a successful atomic media attachment (FEAT-018 D4).
@@ -792,6 +827,8 @@ pub struct PluginDshPreview {
     pub remote_servers: Vec<String>,
     pub local_servers: Vec<String>,
     pub network_hosts: Vec<String>,
+    /// Rows that become Native host code (JavaScript run by the extension host).
+    pub native_rows: Vec<String>,
     pub requires_node: bool,
     /// One line per skipped row or patch operation (a manual port).
     pub manual_ports: Vec<String>,
@@ -1377,6 +1414,17 @@ pub trait CommandSessionLifecycleContext {
     /// never consult it in the baseline, so their paths must not either.
     fn transition_blocked(&self) -> bool;
 
+    /// Why the transition gate is closed, in operator terms; empty means the
+    /// transition is allowed. Consulted only after [`Self::transition_blocked`]
+    /// reports a block, so the refusal can name the work that holds the
+    /// session instead of restating that it is held.
+    ///
+    /// Display projection, not a data source: the strings are pre-rendered
+    /// for a refusal message and carry no stable shape. A caller that needs
+    /// ids, durations, or owners should add a structured method instead of
+    /// parsing these back out.
+    fn transition_blockers(&self) -> Vec<String>;
+
     /// `/branch` with no argument: the current leaf when an active journaled
     /// session resolves, otherwise `None` (the baseline silently falls back
     /// to the usage message on this path).
@@ -1435,8 +1483,8 @@ pub trait CommandSessionLifecycleContext {
 // FEAT-024: session control slice (D2-D7).
 //
 // One independently optional session-control authority covering exactly the
-// host work the six control commands (`/relay`, `/rename`, `/resume`, `/rc`,
-// `/remote-env`, `/title`) consume. `CommandSessionContext` and
+// host work the seven control commands (`/relay`, `/rename`, `/resume`, `/rc`,
+// `/remote-env`, `/title`, `/color`) consume. `CommandSessionContext` and
 // `CommandSessionLifecycleContext` are deliberately not widened: control
 // authority exists only on this facet, and every delegate is an atomic host
 // operation or a semantic projection so handlers keep byte-identical
@@ -1453,6 +1501,10 @@ pub struct RelayProjection {
     /// Authoritative compact-template text (`COMPACT_TEMPLATE`), echoed with
     /// a trailing trim by the handler exactly as today.
     pub compact_template: String,
+    /// Workspace-relative path the relay is written to. The host supplies
+    /// the same path its startup loader reads first, so the writer and the
+    /// loader cannot drift.
+    pub handoff_path: String,
     pub workspace: String,
     pub mode: String,
     pub model: String,
@@ -1621,7 +1673,7 @@ pub struct HostedWorkTarget {
 /// Control authority for the session command slice (FEAT-024 D2/D5).
 ///
 /// Operation-granular synchronous delegates over the exact minimum host work
-/// the six control commands consume. Delegates reproduce the baseline
+/// the seven control commands consume. Delegates reproduce the baseline
 /// check/mutation order (transition gate before resume I/O, save before
 /// publication, single-attempt browser launch) and return portable receipts/
 /// projections or the exact host-error text the baseline surfaces. No
@@ -1631,6 +1683,16 @@ pub struct HostedWorkTarget {
 pub trait CommandSessionControlContext {
     /// Live transition gate consulted by `/resume` before any picker or I/O.
     fn transition_blocked(&self) -> bool;
+
+    /// Why the transition gate is closed, in operator terms; empty means the
+    /// transition is allowed. Consulted only after [`Self::transition_blocked`]
+    /// reports a block.
+    ///
+    /// Display projection, not a data source: the strings are pre-rendered
+    /// for a refusal message and carry no stable shape. A caller that needs
+    /// ids, durations, or owners should add a structured method instead of
+    /// parsing these back out.
+    fn transition_blockers(&self) -> Vec<String>;
 
     /// `/relay`: authoritative semantic snapshot (workspace/mode/model/goal/
     /// to-do/plan/compact-template). Unavailable sources are represented as
@@ -1669,6 +1731,10 @@ pub trait CommandSessionControlContext {
     /// `/title off|clear|none`: clear the session window title with the same
     /// baseline persistence/redraw semantics.
     fn clear_window_title(&mut self) -> Result<(), String>;
+
+    fn composer_color(&self) -> Option<String>;
+
+    fn set_composer_color(&mut self, color: Option<String>) -> Result<(), String>;
 
     /// `/rc status`: current remote-control status line.
     fn remote_status(&self) -> String;

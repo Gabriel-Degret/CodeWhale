@@ -13,6 +13,7 @@ import buildSitemap from "../app/sitemap";
 import { DOC_TOPICS, docTopicHref, getTopic } from "./docs-map";
 import { docsTopicIsCurrent } from "./docs-navigation";
 import { locales } from "./i18n/config";
+import { contentLocalesForPath } from "./i18n/content-locales";
 import { getChrome, getHome } from "./i18n/dictionaries";
 import {
   currentNavHref,
@@ -24,6 +25,7 @@ import {
 } from "./i18n/links";
 import { SITE_URL } from "./page-meta";
 import { siteCss } from "./site-css";
+import { readCatalogue } from "./ratatui/catalogue";
 
 const webRoot = new URL("../", import.meta.url);
 const repoRoot = new URL("../../", import.meta.url);
@@ -90,14 +92,16 @@ describe("sitemap and hreflang preservation", () => {
   });
 
   it("keeps sitemap and hreflang output aligned with real translation coverage", () => {
-    // 18 home locales + 18 /computer-use locales + English-only install + (en, zh) for every
-    // other route (including /docs/guide, /product, /plugins, and /changelog, whose bodies
-    // ship en/zh only).
-    expect(sitemapEntries).toHaveLength(107);
+    // Home and Computer Use have 18 locales; install and the source catalogue are English.
+    // Other page bodies ship English and Chinese.
+    const existingEntries = sitemapEntries.filter(
+      (entry) => new URL(entry.url).pathname.split("/")[2] !== "ratatui",
+    );
+    expect(existingEntries).toHaveLength(110);
     expect(sitemapEntries.filter(entry => entry.url.endsWith("/install")).map(entry => entry.url))
       .toEqual([`${SITE_URL}/en/install`]);
     expect(sitemapEntries.some(entry => entry.url.endsWith("/pricing"))).toBe(false);
-    for (const path of ["/product", "/plugins", "/computer-use", "/signin", "/signup", "/legal/terms", "/legal/privacy"]) {
+    for (const path of ["/product", "/plugins", "/computer-use", "/signin", "/legal/terms", "/legal/privacy"]) {
       expect(
         sitemapEntries.some((entry) => entry.url === `${SITE_URL}/en${path}`),
         path,
@@ -122,6 +126,22 @@ describe("sitemap and hreflang preservation", () => {
     expect(sitemapEntries.every((entry) => !("lastModified" in entry))).toBe(true);
   });
 
+  it("indexes every Ratatui preview with genuine translation alternates", () => {
+    const catalogue = readCatalogue();
+    const paths = ["/ratatui", ...catalogue.entries.map((entry) => `/ratatui/${encodeURIComponent(entry.name)}`)];
+    const expectedUrls = paths.flatMap((path) =>
+      contentLocalesForPath(path).map((locale) => `${SITE_URL}/${locale}${path}`),
+    );
+    const entries = sitemapEntries.filter(
+      (entry) => new URL(entry.url).pathname.split("/")[2] === "ratatui",
+    );
+    expect(entries.map((entry) => entry.url)).toEqual(expectedUrls);
+    expect(new Set(sitemapEntries.map((entry) => entry.url)).size).toBe(sitemapEntries.length);
+    for (const entry of entries) {
+      expect(Object.keys(entry.alternates?.languages ?? {})).toEqual(entry.url.endsWith("/ratatui") ? ["en", "zh"] : ["en"]);
+    }
+  });
+
   it("keeps the new docs pages on the shared metadata helper", () => {
     for (const route of ["guide", "vocabulary"]) {
       const page = webText(`app/[locale]/docs/${route}/page.tsx`);
@@ -130,8 +150,8 @@ describe("sitemap and hreflang preservation", () => {
     }
   });
 
-  it("indexes public sign-in and create-account routes", () => {
-    for (const path of ["/signin", "/signup"]) {
+  it("indexes sign-in and redirects account creation", () => {
+    for (const path of ["/signin"]) {
       expect(
         sitemapEntries.some((entry) => entry.url === `${SITE_URL}/en${path}`),
         path,
@@ -141,11 +161,12 @@ describe("sitemap and hreflang preservation", () => {
     const entry = webText("components/public-account-entry.tsx");
     expect(entry).toContain("<WhalePose");
     expect(entry).toContain("installLocally");
-    expect(webText("app/[locale]/signin/page.tsx")).toContain('kind="sign-in"');
-    expect(webText("app/[locale]/signup/page.tsx")).toContain('kind="sign-up"');
-    // One identity door in the header; the sign-in page links onward to
-    // account creation.
-    expect(nav).toContain("APP_LOGIN_URL");
+    expect(webText("app/[locale]/signin/page.tsx")).toContain("<PublicAccountEntry locale={locale} />");
+    expect(webText("app/[locale]/signup/page.tsx")).toContain('permanentRedirect(`/${locale}/signin`)');
+    expect(sitemapEntries.some((entry) => entry.url.endsWith("/signup"))).toBe(false);
+    expect(sitemapEntries.some((entry) => entry.url.endsWith("/docs/computers"))).toBe(false);
+    expect(webText("app/[locale]/docs/computers/page.tsx")).toContain('permanentRedirect(`/${locale}/docs/fleet`)');
+    expect(nav).not.toContain("APP_LOGIN_URL");
     expect(nav).not.toContain("APP_SIGNUP_URL");
   });
 });
@@ -196,11 +217,11 @@ describe("navigation parity and accessibility", () => {
     const reference = buildNavLinks("en", getChrome("en")).map((l) =>
       l.href.replace(/^\/en\//, ""),
     );
-    expect(reference).toEqual(["product", "models", "plugins", "docs"]);
+    expect(reference).toEqual(["product", "features", "models", "plugins", "docs"]);
     const moreReference = buildSecondaryNavLinks("en", getChrome("en")).map((l) =>
       l.href.replace(/^\/en\//, ""),
     );
-    expect(moreReference).toEqual(["docs/guide", "install", "faq", "community", "contribute"]);
+    expect(moreReference).toEqual(["docs/guide", "install", "ratatui", "faq", "community", "contribute"]);
     for (const locale of locales) {
       const links = buildNavLinks(locale, getChrome(locale));
       expect(
@@ -234,11 +255,11 @@ describe("navigation parity and accessibility", () => {
       ).toEqual(reference);
       const project = footerProjectLinks(locale, getChrome(locale));
       expect(project.map((l) => l.href), `${locale} footer project routes`).toEqual([
-        "https://github.com/Hmbown/CodeWhale",
-        "https://github.com/Hmbown/CodeWhale/issues",
+        "https://github.com/codewhale-hq/CodeWhale",
+        "https://github.com/codewhale-hq/CodeWhale/issues",
         "https://discord.gg/37gfS3ksug",
         `/${locale}/contribute`,
-        "https://github.com/Hmbown/CodeWhale/blob/main/LICENSE",
+        "https://github.com/codewhale-hq/CodeWhale/blob/main/LICENSE",
       ]);
       const legal = footerLegalLinks(locale, getChrome(locale));
       expect(legal.map((l) => l.href), `${locale} footer legal`).toEqual([
@@ -334,7 +355,7 @@ describe("navigation parity and accessibility", () => {
     const license = footerProjectLinks("en", getChrome("en")).at(-1);
     expect(license).toEqual({
       label: "MIT license",
-      href: "https://github.com/Hmbown/CodeWhale/blob/main/LICENSE",
+      href: "https://github.com/codewhale-hq/CodeWhale/blob/main/LICENSE",
     });
     // zh gets the footer legal labels from its dictionary, not English.
     expect(footerLegalLinks("zh", getChrome("zh")).map((l) => l.label)).toEqual([
@@ -358,19 +379,11 @@ describe("homepage integration", () => {
     expect(homepage).toContain("/docs/vocabulary");
   });
 
-  it("keeps the previously pinned homepage facts intact", () => {
-    // Guard against the new band accidentally displacing the public-copy
-    // gate's required surface (the full contract lives in public-copy.test.ts).
+  it("keeps the published release separate from the source candidate", () => {
     expect(homepage).toContain("facts.latestPublishedRelease");
     // The unreleased-source label is the EN dictionary value the page renders
     // (plain "Unreleased", per docs/design/WEB_VOICE.md).
     expect(homepage).toContain("d.sourceCandidate");
     expect(getHome("en").sourceCandidate).toBe("Unreleased");
-    // The terminal is the live capture, labelled with the captured build.
-    expect(homepage).toContain("<TerminalCapture");
-    expect(homepage).toContain("TERMINAL_SCREENSHOT.version");
-    for (const label of ["Plan", "Work", "Operate", "Ask", "Auto-Review", "Full Access"]) {
-      expect(homepage).toContain(label);
-    }
   });
 });

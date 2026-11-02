@@ -321,16 +321,7 @@ pub(crate) fn escape_review_path(path: &Path) -> String {
 pub(crate) fn escape_review_text(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
-        if ch.is_control()
-            || matches!(
-                ch,
-                '\u{061c}'
-                    | '\u{200e}'
-                    | '\u{200f}'
-                    | '\u{202a}'..='\u{202e}'
-                    | '\u{2066}'..='\u{2069}'
-            )
-        {
+        if ch.is_control() || codewhale_sanitize::sanitize::is_bidi_control(ch) {
             let _ = write!(escaped, "\\u{{{:x}}}", ch as u32);
         } else if matches!(
             ch,
@@ -373,4 +364,90 @@ fn _diagnostic_path(diagnostic: &PluginDiagnostic) -> Option<String> {
         .path
         .as_ref()
         .map(|path| path.display().to_string())
+}
+
+/// `/plugin doctor` output: what is superseded, what was kept and why, and
+/// the state-file effect. Every dynamic string is escaped; paths and ids come
+/// from the filesystem and from plugin state, which a bundle can influence.
+pub(super) fn render_gc_report(
+    report: &crate::plugins::registry::gc::GcReport,
+    fixed: bool,
+) -> String {
+    use crate::plugins::registry::gc::format_bytes;
+
+    const SHOWN: usize = 40;
+    let mut out = String::new();
+    let title = if fixed {
+        "Plugin doctor: applied"
+    } else {
+        "Plugin doctor: report (nothing was changed)"
+    };
+    let _ = writeln!(out, "{title}\n");
+    if report.items.is_empty() {
+        let _ = writeln!(
+            out,
+            "Nothing to retire. {} state records, {}.",
+            report.records_before,
+            format_bytes(report.state_bytes_before)
+        );
+    } else {
+        let verb = if fixed { "Retired" } else { "Would retire" };
+        let records = report
+            .items
+            .iter()
+            .filter(|item| item.kind == crate::plugins::registry::gc::GcKind::Record)
+            .count();
+        let _ = writeln!(
+            out,
+            "{verb} {records} records and {} directories ({} on disk). state.json: {} -> {} records, {} -> {}.\n",
+            report.items.len() - records,
+            format_bytes(report.reclaimable_bytes()),
+            report.records_before,
+            report.records_after,
+            format_bytes(report.state_bytes_before),
+            format_bytes(report.state_bytes_after),
+        );
+        for item in report.items.iter().take(SHOWN) {
+            let gate = if item.explicit && !fixed {
+                " [--fix only]"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                out,
+                "  {}{gate} {}: {}",
+                item.kind.label(),
+                escape_review_text(&item.target),
+                escape_review_text(&item.reason)
+            );
+        }
+        if report.items.len() > SHOWN {
+            let _ = writeln!(out, "  ... and {} more", report.items.len() - SHOWN);
+        }
+    }
+    if !report.kept.is_empty() {
+        let _ = writeln!(out, "\nKept ({}):", report.kept.len());
+        for line in report.kept.iter().take(10) {
+            let _ = writeln!(out, "  {}", escape_review_text(line));
+        }
+        if report.kept.len() > 10 {
+            let _ = writeln!(out, "  ... and {} more", report.kept.len() - 10);
+        }
+    }
+    for note in &report.notes {
+        let _ = writeln!(out, "\nNote: {}", escape_review_text(note));
+    }
+    for failure in &report.failures {
+        let _ = writeln!(out, "\nCould not remove {}", escape_review_text(failure));
+    }
+    if fixed {
+        if !report.items.is_empty() {
+            out.push_str("\nThe previous state.json is kept as state.json.pre-gc.");
+        }
+    } else if !report.items.is_empty() {
+        out.push_str(
+            "\nRun /plugin doctor --fix to apply. Items not marked [--fix only] are also retired automatically at startup.",
+        );
+    }
+    out
 }

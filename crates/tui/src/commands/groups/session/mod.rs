@@ -6,6 +6,7 @@ use codewhale_command_contract::metadata::{CommandInfo, RegisterCommand};
 use codewhale_command_contract::outcome::SessionCommandResult as CommandResult;
 
 pub(in crate::commands) mod branch;
+pub(in crate::commands) mod color;
 pub(in crate::commands) mod compact;
 pub(in crate::commands) mod export;
 pub(in crate::commands) mod fork;
@@ -27,6 +28,30 @@ pub(in crate::commands) mod tree;
 mod session;
 
 pub(in crate::commands) const MAX_TITLE_LEN: usize = 100;
+
+/// The one way the lifecycle commands report a closed transition gate: the
+/// verb, the named blockers, and the exits that actually clear them.
+pub(in crate::commands) fn transition_blocked_message(verb: &str, blockers: &[String]) -> String {
+    let mut message = format!("Cannot {verb} while runtime work is active");
+    if blockers.is_empty() {
+        message.push('.');
+    } else {
+        message.push(':');
+        for blocker in blockers {
+            message.push_str("\n  • ");
+            message.push_str(blocker);
+        }
+    }
+    // `/jobs cancel-all` only kills shell processes and answers "No running
+    // commands to cancel." for everything else, so it must not read as the
+    // exit for a turn, dispatch, compaction, or cleanup blocker. Name both
+    // exits with the scope each one actually clears.
+    message.push_str(
+        "\n\nWait for the work to finish, or stop what you can: \
+         Ctrl+C stops a running turn, and /jobs cancel-all cancels running shell jobs.",
+    );
+    message
+}
 
 /// Promote the no-action structcopy result to the group's action vocabulary.
 /// The leaf itself retains its narrower, impossible-action return type.
@@ -51,10 +76,11 @@ impl RegisterCommand<CommandResult> for StructcopyRegistration {
 }
 
 /// Complete group inventory, used by the host and independent compilation proof.
-pub fn portable_handlers() -> [(&'static CommandInfo, CommandHandler<CommandResult>); 17] {
+pub fn portable_handlers() -> [(&'static CommandInfo, CommandHandler<CommandResult>); 18] {
     [
         (rename::RenameCmd::info(), rename::RenameCmd::handler()),
         (title::TitleCmd::info(), title::TitleCmd::handler()),
+        (color::ColorCmd::info(), color::ColorCmd::handler()),
         (save::SaveCmd::info(), save::SaveCmd::handler()),
         (fork::ForkCmd::info(), fork::ForkCmd::handler()),
         (new::NewCmd::info(), new::NewCmd::handler()),

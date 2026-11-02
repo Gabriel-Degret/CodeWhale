@@ -19,6 +19,7 @@ export const chrome: ChromeDict = {
   navCommunity: "Komunitas",
   navContribute: "Kontribusi",
 
+  navFeatures: "Kemampuan",
   navProduct: "Produk",
   navModels: "Model",
   navPlugins: "Plugin",
@@ -29,8 +30,6 @@ export const chrome: ChromeDict = {
   navHomeAria: "Beranda Codewhale",
 
   installCta: "Instal →",
-
-  authSignIn: "Masuk",
 
   dateLocale: "id-ID",
 
@@ -44,7 +43,7 @@ export const chrome: ChromeDict = {
   themeTitle: "Tema · otomatis / terang / gelap",
 
   footerTagline:
-    "Ciptakan apa yang Anda inginkan dan otomatisasikan pekerjaan sehari-hari dengan model pilihan Anda.",
+    "Agen pemrograman sumber terbuka untuk terminalmu dan model pilihanmu.",
   footerProduct: "Produk",
   footerProject: "Proyek",
   footerDocs: "Dokumentasi",

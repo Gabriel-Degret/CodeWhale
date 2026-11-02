@@ -10,7 +10,7 @@ use super::spec::{
 use super::web::extract::{DocumentKind, ExtractedDocument, extract_document};
 #[cfg(test)]
 use super::web::fetch::fetch_readable_with_initial_pin;
-use super::web::fetch::{FetchOptions, HARD_MAX_BYTES, fetch_readable};
+use super::web::fetch::{FetchOptions, HARD_MAX_BYTES, Readable, fetch_readable};
 #[cfg(test)]
 use super::web::guard::DnsPin;
 use super::web::overflow::bound_text as bound_web_text;
@@ -214,6 +214,7 @@ struct WebPage {
     links: Vec<WebLink>,
     pdf_pages: Option<Vec<Vec<String>>>,
     truncated: bool,
+    partial: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -291,6 +292,10 @@ struct PageViewResult {
     total_lines: usize,
     #[serde(default, skip_serializing_if = "is_false")]
     truncated: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    partial: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
     content: String,
     links: Vec<WebLink>,
 }
@@ -624,7 +629,7 @@ impl ToolSpec for WebRunTool {
                     .unwrap_or_default();
 
                 let (mut entries, warning) =
-                    run_image_search(&query, max_results, timeout_ms, &domains).await?;
+                    run_image_search(&query, max_results, timeout_ms, &domains, context).await?;
                 entries.retain_mut(|entry| {
                     let canonical_url = entry.url.as_deref().unwrap_or(&entry.image);
                     let Some(citation) = super::web::citations::register(
@@ -1030,13 +1035,13 @@ fn looks_like_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DuckDuckGoImageResponse {
     #[serde(default)]
     results: Vec<DuckDuckGoImageResult>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DuckDuckGoImageResult {
     image: String,
     #[serde(default)]
@@ -1095,7 +1100,9 @@ async fn run_image_search(
     max_results: usize,
     timeout_ms: u64,
     domains: &[String],
+    context: &ToolContext,
 ) -> Result<(Vec<ImageResultEntry>, Option<String>), ToolError> {
+    super::web_search::check_policy(context.network_policy.as_ref(), "duckduckgo.com")?;
     let client = crate::tls::reqwest_client_builder()
         .timeout(Duration::from_millis(timeout_ms))
         .user_agent(USER_AGENT)
@@ -1119,9 +1126,18 @@ async fn run_image_search(
         })?;
 
     let seed_status = seed_resp.status();
-    let seed_body = seed_resp.text().await.map_err(|e| {
-        ToolError::execution_failed(format!("Failed to read image seed response: {e}"))
-    })?;
+    let seed_body = if super::web::adapter::search_selected(context) {
+        super::web::adapter::read_response_with_limit(seed_resp, context, HARD_MAX_BYTES)
+            .await
+            .map_err(ToolError::from)?
+    } else {
+        let bytes = crate::utils::read_response_body_capped(seed_resp, HARD_MAX_BYTES)
+            .await
+            .map_err(|e| {
+                ToolError::execution_failed(format!("Failed to read image seed response: {e}"))
+            })?;
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
 
     if !seed_status.is_success() {
         return Err(ToolError::execution_failed(format!(
@@ -1136,6 +1152,7 @@ async fn run_image_search(
 
     // Step 2: query the DuckDuckGo images JSON endpoint.
     let api_url = format!("https://duckduckgo.com/i.js?l=us-en&o=json&q={encoded}&vqd={vqd}&p=1");
+    super::web_search::check_policy(context.network_policy.as_ref(), "duckduckgo.com")?;
     let api_resp = client
         .get(&api_url)
         .header("Accept", "application/json")
@@ -1145,10 +1162,18 @@ async fn run_image_search(
         .map_err(|e| ToolError::execution_failed(format!("Image search request failed: {e}")))?;
 
     let api_status = api_resp.status();
-    let api_body = api_resp
-        .text()
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("Failed to read image response: {e}")))?;
+    let api_body = if super::web::adapter::search_selected(context) {
+        super::web::adapter::read_response(api_resp, context)
+            .await
+            .map_err(ToolError::from)?
+    } else {
+        let bytes = crate::utils::read_response_body_capped(api_resp, HARD_MAX_BYTES)
+            .await
+            .map_err(|e| {
+                ToolError::execution_failed(format!("Failed to read image response: {e}"))
+            })?;
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
 
     if !api_status.is_success() {
         return Err(ToolError::execution_failed(format!(
@@ -1157,9 +1182,56 @@ async fn run_image_search(
         )));
     }
 
-    let parsed: DuckDuckGoImageResponse = serde_json::from_str(&api_body).map_err(|e| {
+    let mut parsed: DuckDuckGoImageResponse = serde_json::from_str(&api_body).map_err(|e| {
         ToolError::execution_failed(format!("Failed to parse image search JSON: {e}"))
     })?;
+
+    if super::web::adapter::search_selected(context) {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Proposal {
+            kind: String,
+            entries: Vec<DuckDuckGoImageResult>,
+            max_results: usize,
+        }
+        let mut urls = super::web_search::OpaqueUrls::default();
+        let mut captured = parsed.clone();
+        for entry in &mut captured.results {
+            entry.image = urls.capture(&entry.image);
+            if let Some(value) = entry.thumbnail.as_mut() {
+                *value = urls.capture(value);
+            }
+            if let Some(value) = entry.url.as_mut() {
+                *value = urls.capture(value);
+            }
+        }
+        let proposal: Proposal = super::web::adapter::transform(
+            crate::extension_host::StockOperation::WebImages,
+            json!({"max_results":max_results,"parsed":captured}),
+            context,
+            Duration::from_millis(timeout_ms),
+        )
+        .await
+        .map_err(ToolError::from)?;
+        if proposal.kind != "web_images"
+            || proposal.max_results != max_results
+            || proposal.entries.len() > parsed.results.len()
+        {
+            return Err(ToolError::execution_failed(
+                "Web Host returned inconsistent image candidates; no fallback was attempted",
+            ));
+        }
+        parsed.results = proposal.entries;
+        for entry in &mut parsed.results {
+            entry.image = urls.restore(&entry.image).map_err(ToolError::from)?;
+            if let Some(value) = entry.thumbnail.as_mut() {
+                *value = urls.restore(value).map_err(ToolError::from)?;
+            }
+            if let Some(value) = entry.url.as_mut() {
+                *value = urls.restore(value).map_err(ToolError::from)?;
+            }
+        }
+    }
 
     let mut results = parsed
         .results
@@ -1226,6 +1298,7 @@ fn page_from_search(query: &str, results: &[NormalizedSearchResult]) -> WebPage 
         links,
         pdf_pages: None,
         truncated: false,
+        partial: None,
     }
 }
 
@@ -1261,7 +1334,7 @@ async fn fetch_page_with(
         },
     )
     .await?;
-    page_from_document(readable.payload, readable.document, context)
+    page_from_readable(readable.payload, readable.document, context)
 }
 
 #[cfg(test)]
@@ -1282,7 +1355,7 @@ async fn fetch_page_with_initial_pin(
         },
     )
     .await?;
-    page_from_document(readable.payload, readable.document, context)
+    page_from_readable(readable.payload, readable.document, context)
 }
 
 /// Reject non-2xx responses, then extract one readable document.
@@ -1292,20 +1365,38 @@ async fn fetch_page_with_initial_pin(
 async fn document_from_fetched(
     payload: &super::web::fetch::FetchedPayload,
     context: &ToolContext,
-) -> Result<ExtractedDocument, ToolError> {
+) -> super::web::adapter::AdapterResult<ExtractedDocument> {
     if !(200..300).contains(&payload.status) {
-        return Err(ToolError::execution_failed(format!(
+        return Err((ToolError::execution_failed(format!(
             "Web request to {} failed: HTTP {}",
             payload.url, payload.status
-        )));
+        )))
+        .into());
     }
     extract_document(
         &payload.url,
         Some(&payload.content_type),
         &payload.bytes,
-        context.cancel_token.as_ref(),
+        payload.truncated,
+        Some(context),
     )
     .await
+}
+
+fn page_from_readable(
+    payload: super::web::fetch::FetchedPayload,
+    document: Readable<ExtractedDocument>,
+    context: &ToolContext,
+) -> Result<WebPage, ToolError> {
+    match document {
+        Readable::Document(document) => page_from_document(payload, document, context),
+        Readable::Partial(page) => {
+            page_from_document(payload, page.document, context).map(|web_page| WebPage {
+                partial: Some(page.note),
+                ..web_page
+            })
+        }
+    }
 }
 
 fn page_from_document(
@@ -1328,6 +1419,7 @@ fn page_from_document(
                 links,
                 pdf_pages: None,
                 truncated: payload.truncated,
+                partial: None,
             })
         }
         DocumentKind::Markdown => {
@@ -1340,6 +1432,7 @@ fn page_from_document(
                 links,
                 pdf_pages: None,
                 truncated: payload.truncated,
+                partial: None,
             })
         }
         DocumentKind::Text => Ok(WebPage {
@@ -1350,6 +1443,7 @@ fn page_from_document(
             links: Vec::new(),
             pdf_pages: None,
             truncated: payload.truncated,
+            partial: None,
         }),
         DocumentKind::Pdf => {
             let pages = document.pdf_pages.unwrap_or_default();
@@ -1361,6 +1455,7 @@ fn page_from_document(
                 links: Vec::new(),
                 pdf_pages: Some(pages),
                 truncated: payload.truncated,
+                partial: None,
             })
         }
         DocumentKind::Media => {
@@ -1387,6 +1482,7 @@ fn page_from_document(
                 links: Vec::new(),
                 pdf_pages: None,
                 truncated: payload.truncated,
+                partial: None,
             })
         }
     }
@@ -1414,6 +1510,10 @@ fn bounded_web_run_result(
             "artifact_relative_path": crate::artifacts::format_artifact_relative_path(&artifact.relative_path),
             "artifact_byte_size": artifact.byte_size,
             "artifact_preview": artifact.preview,
+            // The overflow footer points at `retrieve_tool_result`; flag the
+            // evidence so the engine auto-activates that tool next turn (same
+            // contract as the shell-truncation spillover).
+            "evidence_available": true,
         })
     });
 
@@ -1460,6 +1560,8 @@ fn render_view(
         line_end: end,
         total_lines: total,
         truncated: page.truncated,
+        partial: page.partial.is_some(),
+        note: page.partial.clone(),
         content,
         links: page.links.clone(),
     }
@@ -1792,6 +1894,7 @@ mod tests {
             links: Vec::new(),
             pdf_pages: None,
             truncated: false,
+            partial: None,
         }
     }
 
@@ -1855,6 +1958,12 @@ mod tests {
 
         assert!(result.content.contains("retrieve_tool_result"));
         assert!(result.content.chars().count() <= inline_char_budget(&context));
+        assert_eq!(
+            metadata["evidence_available"],
+            json!(true),
+            "overflow footer points at retrieve_tool_result; the metadata must \
+             flag the evidence so the engine auto-activates that tool:\n{metadata}"
+        );
         assert_eq!(
             serde_json::from_str::<Value>(&full).unwrap()["warnings"][0],
             output.warnings[0]

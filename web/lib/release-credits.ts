@@ -15,24 +15,25 @@
  * See also:
  *   - .github/AUTHOR_MAP for identity mapping
  *   - CHANGELOG.md for the full release narrative
- *   - https://github.com/Hmbown/CodeWhale/graphs/contributors for the live list
+ *   - https://github.com/codewhale-hq/CodeWhale/graphs/contributors for the live list
  */
 
 /** Contributors whose PRs were merged or harvested into this release. */
 export const RELEASE_CONTRIBUTORS: string[] = [
-  "@Andrea-Bruno",
-  "@aiapienthusiast",
+  "@dsingal0",
+  "@shenjackyuanjie",
+  "@aboimpinto",
+  "@printf033",
+  "@henrikdukefoss",
+  "@SparkofSpike",
+  "@dajiaohuang",
   "@gaord",
   "@Lstarsky0",
-  "@aboimpinto",
-  "@dajiaohuang",
-  "@Water-Run",
-  "@wuisabel-gif",
-  "@SparkofSpike",
-  "@zhuowp",
-  "@harryvgiunta",
+  "@jayanthvee",
+  "@leoca",
   "@asto18089",
-  "@qiuYliangM",
+  "@LIghtJUNction",
+  "@zhuowp",
 ];
 
 /**
@@ -44,6 +45,17 @@ export const UNRELEASED_CONTRIBUTORS: string[] = [];
 
 /**
  * Contributors who helped with reports, reproductions, and verification.
- * Credit covers the 0.10.1 reports recorded in docs/CONTRIBUTORS.md.
+ * Credit covers the 0.10.2 reports recorded in docs/CONTRIBUTORS.md.
  */
-export const RELEASE_HELPERS: string[] = ["@BX166", "@cenab"];
+export const RELEASE_HELPERS: string[] = [
+  "@BX166",
+  "@harryvizcaino-oss",
+  "@rafacouto",
+  "@luestr",
+  "@SergiuSSoluS",
+  "@8sero",
+  "@Asteria1028",
+  "@SakuraNeko",
+  "@Statter",
+  "@7jrxt42BxFZo4iAnN4CX",
+];

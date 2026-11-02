@@ -48,12 +48,104 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::network_policy::{Decision, NetworkPolicy, host_from_url};
+use crate::network_policy::{Decision, NetworkPolicy, NetworkPolicyDecider, host_from_url};
+use crate::tools::web::guard::{
+    DnsPin, fetch_target_host, guarded_reqwest_client_builder, validate_fetch_destination,
+};
 
-fn reqwest_client() -> reqwest::Client {
-    codewhale_release::platform_http_client_builder()
-        .build()
-        .expect("build platform HTTP client")
+const MAX_INSTALL_REDIRECTS: usize = 5;
+
+/// Connect and total budgets for install and registry-sync HTTP requests.
+fn install_http_timeouts() -> (std::time::Duration, std::time::Duration) {
+    if cfg!(test) {
+        // Short enough that the stalled-server regression test finishes
+        // quickly, long enough that happy-path tests never approach it.
+        (
+            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(2),
+        )
+    } else {
+        (
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(600),
+        )
+    }
+}
+
+fn reqwest_client(proxy: Option<reqwest::Proxy>, pin: DnsPin) -> reqwest::Client {
+    let (connect_timeout, total_timeout) = install_http_timeouts();
+    let mut builder = guarded_reqwest_client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        // The shared platform builder sets no timeouts; without a bound, a
+        // connection that opens but stalls (dead proxy, black-holed route)
+        // hangs installs and registry sync forever. Connect is bounded tightly;
+        // the total budget is generous for 5 MiB tarballs on slow links
+        // (registry sync fans out `SYNC_REGISTRY_CONCURRENCY` of these in
+        // parallel).
+        .connect_timeout(connect_timeout)
+        .timeout(total_timeout);
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    } else if let Some((host, ip)) = pin {
+        builder = builder.resolve(&host, std::net::SocketAddr::new(ip, 0));
+    }
+    builder.build().expect("build platform HTTP client")
+}
+
+async fn guarded_get(
+    url: &str,
+    network: &NetworkPolicy,
+    if_none_match: Option<&str>,
+) -> Result<reqwest::Response> {
+    let decider = NetworkPolicyDecider::new(network.clone(), None);
+    let mut current = reqwest::Url::parse(url).with_context(|| format!("invalid url: {url}"))?;
+    let mut initial_pin: Option<DnsPin> =
+        (cfg!(test) && current.host_str() == Some("127.0.0.1")).then_some(None);
+    for _ in 0..=MAX_INSTALL_REDIRECTS {
+        let host = fetch_target_host(&current)?;
+        if matches!(network.decide(&host), Decision::Deny) {
+            bail!("network policy denies {host}");
+        }
+        let proxy = if initial_pin.is_some() {
+            None
+        } else {
+            crate::mcp::configured_mcp_proxy(&current, false, |key| std::env::var(key))?
+        };
+        let pin = match initial_pin.take() {
+            Some(pin) => pin,
+            None => {
+                validate_fetch_destination(host, Some(&decider), "skill_install", proxy.is_none())
+                    .await?
+            }
+        };
+        let mut request = reqwest_client(proxy, pin).get(current.clone());
+        if let Some(etag) = if_none_match {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("failed to GET {current}"))?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        let Some(location) = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return Ok(response);
+        };
+        let next = response
+            .url()
+            .join(location)
+            .with_context(|| format!("invalid redirect location from {current}"))?;
+        if current.scheme() == "https" && next.scheme() != "https" {
+            bail!("redirect from {current} would downgrade HTTPS");
+        }
+        current = next;
+    }
+    bail!("{url} exceeded {MAX_INSTALL_REDIRECTS} redirects")
 }
 
 /// Cache directory for registry-synced skills.
@@ -559,9 +651,7 @@ pub async fn fetch_registry(
         Decision::Deny => return Ok(RegistryFetchResult::Denied(host)),
         Decision::Prompt => return Ok(RegistryFetchResult::NeedsApproval(host)),
     }
-    let response = reqwest_client()
-        .get(registry_url)
-        .send()
+    let response = guarded_get(registry_url, network, None)
         .await
         .with_context(|| format!("failed to fetch registry {registry_url}"))?
         .error_for_status()
@@ -732,15 +822,9 @@ async fn sync_one_skill(
             .and_then(|s| serde_json::from_str(&s).ok());
 
         // Build the request — add If-None-Match if we have a cached ETag.
-        let client = reqwest_client();
-        let mut req = client.get(url);
-        if let Some(ref meta) = existing_meta
-            && let Some(ref etag) = meta.etag
-        {
-            req = req.header("If-None-Match", etag);
-        }
+        let cached_etag = existing_meta.as_ref().and_then(|meta| meta.etag.as_deref());
 
-        let resp = match req.send().await {
+        let resp = match guarded_get(url, network, cached_etag).await {
             Ok(r) => r,
             Err(err) => {
                 // Network error — try the next candidate URL.
@@ -1051,9 +1135,8 @@ async fn candidate_urls(
     match source {
         InstallSource::GitHubRepo(repo) => {
             // GitHub's archive endpoint lives on `codeload.github.com` after
-            // the redirect, but the public URL we hit is `github.com`. Both
-            // typically appear in user allow lists; we check the canonical
-            // host.
+            // the redirect, but the public URL we hit is `github.com`. Every
+            // hop is checked, so a deny-default allow list needs both hosts.
             Ok(UrlResolution::Resolved(vec![
                 format!("https://github.com/{repo}/archive/refs/heads/main.tar.gz"),
                 format!("https://github.com/{repo}/archive/refs/heads/master.tar.gz"),
@@ -1117,7 +1200,7 @@ async fn download_first_success(
                 continue;
             }
         }
-        match download_with_cap(url, max_size).await? {
+        match download_with_cap(url, network, max_size).await? {
             DownloadAttempt::Bytes(bytes) => {
                 return Ok(DownloadOutcome::Bytes {
                     bytes,
@@ -1152,12 +1235,12 @@ enum DownloadAttempt {
 /// Stream a URL into memory with a size cap. Aborts on the first read that
 /// would push the buffer over `max_size * 4` (the *4 accounts for compression;
 /// the unpack step still enforces `max_size` on the *uncompressed* bytes).
-async fn download_with_cap(url: &str, max_size: u64) -> Result<DownloadAttempt> {
-    let resp = reqwest_client()
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("failed to GET {url}"))?;
+async fn download_with_cap(
+    url: &str,
+    network: &NetworkPolicy,
+    max_size: u64,
+) -> Result<DownloadAttempt> {
+    let resp = guarded_get(url, network, None).await?;
     let status = resp.status();
     if !status.is_success() {
         if status == reqwest::StatusCode::NOT_FOUND {
@@ -1828,7 +1911,7 @@ mod tests {
             let url = format!("http://{addr}/{path}");
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(20),
-                download_with_cap(&url, 16 * 1024),
+                download_with_cap(&url, &NetworkPolicy::default(), 16 * 1024),
             )
             .await
             .unwrap_or_else(|_| panic!("{path}: the size cap must end the read"));
@@ -1838,6 +1921,49 @@ mod tests {
             };
             assert!(err.contains("exceeds"), "{path}: {err}");
         }
+    }
+
+    /// A server that accepts the connection and then never reads or writes
+    /// another byte, so the request can only end through the client's own
+    /// timeouts.
+    async fn stalled_server() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Hold every accepted socket open without responding.
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn stalled_registry_fetch_fails_through_the_client_timeouts() {
+        let addr = stalled_server().await;
+        let url = format!("http://{addr}/index.json");
+        let policy = NetworkPolicy {
+            default: Decision::Allow.into(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+            proxy: Vec::new(),
+            proxy_fake_ip_cidrs: Vec::new(),
+            audit: false,
+        };
+        // Without the install client's own timeouts this call never returns;
+        // the outer bound only converts that hang into a test failure.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            fetch_registry(&policy, &url),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("install HTTP must honor its own timeouts"));
+        let err = match outcome {
+            Ok(_) => panic!("a stalled registry connection must fail, not succeed"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(err.contains("timed out"), "{err}");
     }
 
     #[test]

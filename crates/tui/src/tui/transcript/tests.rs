@@ -1,15 +1,15 @@
 use super::*;
 use crate::tools::plan::PlanSnapshot;
 use crate::tui::history::{
-    ExecCell, ExecSource, HistoryCell, PlanUpdateCell, ReasoningAction, ReasoningActionTarget,
-    ThinkingFold, ToolCell, ToolStatus, TranscriptActionOwner,
+    CellFoldAction, CellFoldActionTarget, ExecCell, ExecSource, HistoryCell, PlanUpdateCell,
+    ToolCell, ToolStatus, TranscriptActionOwner, TranscriptFold,
 };
 use codewhale_localization::Locale;
 use codewhale_palette as palette;
 
 impl TranscriptViewCache {
-    pub(crate) fn reasoning_action_target(&self) -> Option<ReasoningActionTarget> {
-        self.reasoning_action_target
+    pub(crate) fn fold_action_target(&self) -> Option<CellFoldActionTarget> {
+        self.fold_action_target
     }
 
     fn streaming_lines_reflattened(&self) -> u64 {
@@ -65,6 +65,124 @@ fn reasoning_owner(cell_index: usize) -> TranscriptActionOwner {
     }
 }
 
+#[test]
+fn ordinary_fold_keeps_original_owner_through_filter_and_narrow_resize() {
+    let body = (1..=12)
+        .map(|line| format!("answer line {line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let cells = [assistant_cell(&body, false)];
+    let folds = HashMap::from([(7, TranscriptFold::Collapsed)]);
+    let owner = reasoning_owner(7);
+    let options = TranscriptRenderOptions {
+        low_motion: true,
+        ..Default::default()
+    };
+    let mut cache = TranscriptViewCache::new();
+    for width in 1..=40 {
+        cache.ensure_split(&[&cells], &[1], width, options, &folds, Some(&[7]), None);
+        let rows = cache.total_lines();
+        assert!(rows > 0);
+        assert!(cache.lines()[0].width() <= usize::from(width));
+        cache.retarget(Some(owner), Some(&[7]));
+        assert_eq!(cache.total_lines(), rows, "hint never changes geometry");
+        assert_eq!(
+            cache.fold_action_target(),
+            Some(CellFoldActionTarget {
+                owner,
+                action: CellFoldAction::Expand
+            })
+        );
+        assert!(cache.lines()[0].width() <= usize::from(width));
+        assert_eq!(
+            cache.line_meta()[0].copy_prefix_width(),
+            cache.lines()[0].width()
+        );
+        cache.retarget(Some(reasoning_owner(0)), Some(&[7]));
+        assert!(
+            cache.fold_action_target().is_none(),
+            "filtered index is not original identity"
+        );
+    }
+}
+
+#[test]
+fn folded_streaming_answer_preserves_links_and_restores_latest_body() {
+    let content = format!(
+        "[reference](https://example.com/reference)\n\n{}",
+        (1..=12)
+            .map(|line| format!("paragraph {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    );
+    let mut cells = [assistant_cell(&content, true)];
+    let options = TranscriptRenderOptions {
+        low_motion: true,
+        ..Default::default()
+    };
+    let mut cache = TranscriptViewCache::new();
+    let owner = Some(reasoning_owner(0));
+    let mut folds = HashMap::from([(0, TranscriptFold::Collapsed)]);
+    cache.ensure_split(&[&cells], &[1], 80, options, &folds, None, owner);
+    assert!(plain_lines(&cache).join("\n").contains("Space:expand"));
+    assert!(!plain_lines(&cache).join("\n").contains("paragraph 12"));
+    assert!(cache.line_links[0].is_empty());
+    assert!(
+        cache
+            .line_links
+            .iter()
+            .skip(1)
+            .any(|links| !links.is_empty()),
+        "preview body retains its link"
+    );
+    let before = (cache.cells_rendered, cache.streaming_lines_reflattened());
+    cache.ensure_split(&[&cells], &[1], 80, options, &folds, None, owner);
+    assert_eq!(
+        (cache.cells_rendered, cache.streaming_lines_reflattened()),
+        before,
+        "settled folded frame does no work"
+    );
+
+    let HistoryCell::Assistant { content, .. } = &mut cells[0] else {
+        unreachable!()
+    };
+    content.push_str("\n\nlatest streamed paragraph");
+    cache.ensure_split(&[&cells], &[2], 80, options, &folds, None, owner);
+    assert!(
+        !plain_lines(&cache)
+            .join("\n")
+            .contains("latest streamed paragraph")
+    );
+    assert_eq!(
+        cache.fold_action_target().unwrap().action,
+        CellFoldAction::Expand
+    );
+    folds.insert(0, TranscriptFold::Expanded);
+    cache.ensure_split(&[&cells], &[2], 80, options, &folds, None, owner);
+    assert!(
+        plain_lines(&cache)
+            .join("\n")
+            .contains("latest streamed paragraph")
+    );
+    let mut cold = TranscriptViewCache::new();
+    cold.ensure_split(&[&cells], &[2], 80, options, &folds, None, owner);
+    assert_same_flat_output(&cache, &cold);
+
+    let HistoryCell::Assistant { content, .. } = &mut cells[0] else {
+        unreachable!()
+    };
+    content.push_str("\n\ncontinued after unfolding");
+    cache.ensure_split(&[&cells], &[3], 80, options, &folds, None, owner);
+    let mut cold = TranscriptViewCache::new();
+    cold.ensure_split(&[&cells], &[3], 80, options, &folds, None, owner);
+    assert_same_flat_output(&cache, &cold);
+    assert!(
+        plain_lines(&cache)
+            .join("\n")
+            .contains("continued after unfolding")
+    );
+}
+
 fn exec_tool_cell_with_output(command: &str, output: String) -> HistoryCell {
     // A failed shell cell keeps its full output in the live render, so
     // this fixture proves tool cells do not inherit the prose measure.
@@ -79,7 +197,9 @@ fn exec_tool_cell_with_output(command: &str, output: String) -> HistoryCell {
         started_at: None,
         duration_ms: None,
         stale_elapsed_since_output_ms: None,
+        waiting: None,
         source: ExecSource::Assistant,
+        description: None,
         interaction: None,
         output_summary: None,
     }))
@@ -97,7 +217,9 @@ fn exec_tool_cell(command: &str) -> HistoryCell {
         started_at: None,
         duration_ms: None,
         stale_elapsed_since_output_ms: None,
+        waiting: None,
         source: ExecSource::Assistant,
+        description: None,
         interaction: None,
         output_summary: None,
     }))
@@ -643,34 +765,21 @@ fn semantic_boundary_matrix_has_four_deliberate_rhythm_levels() {
         1
     );
     assert_eq!(
-        spacer_rows_for_boundary(Turn, TranscriptSpacing::Comfortable),
-        1
-    );
-    assert_eq!(
         spacer_rows_for_boundary(Turn, TranscriptSpacing::Spacious),
-        2
+        3
     );
     assert_eq!(
         spacer_rows_for_boundary(Activity, TranscriptSpacing::Compact),
         0
     );
     assert_eq!(
-        spacer_rows_for_boundary(Activity, TranscriptSpacing::Comfortable),
-        1
-    );
-    assert_eq!(
         spacer_rows_for_boundary(Activity, TranscriptSpacing::Spacious),
-        1
+        2
     );
     assert_eq!(
         spacer_rows_for_boundary(GroupedTool, TranscriptSpacing::Compact),
         0,
         "compact density buys its density by spending no separator rows"
-    );
-    assert_eq!(
-        spacer_rows_for_boundary(GroupedTool, TranscriptSpacing::Comfortable),
-        0,
-        "the shared rail carries grouping without a row per tool call"
     );
     assert_eq!(
         spacer_rows_for_boundary(GroupedTool, TranscriptSpacing::Spacious),
@@ -679,29 +788,18 @@ fn semantic_boundary_matrix_has_four_deliberate_rhythm_levels() {
     );
 }
 
-/// Separation is one row or none. Nothing in the matrix may produce a
-/// double blank, because a scrolling terminal cannot afford it.
+/// Compact never spends a double blank, because a scrolling terminal cannot
+/// afford it. Spacious buys its air at turn and activity seams by design.
 #[test]
-fn no_boundary_ever_spends_more_than_one_row_below_spacious_turns() {
+fn compact_never_spends_more_than_one_row_at_any_boundary() {
     use TranscriptBoundary::{Activity, GroupedTool, Joined, Turn};
 
     for boundary in [Joined, GroupedTool, Activity, Turn] {
-        for spacing in [
-            TranscriptSpacing::Compact,
-            TranscriptSpacing::Comfortable,
-            TranscriptSpacing::Spacious,
-        ] {
-            let rows = spacer_rows_for_boundary(boundary, spacing);
-            let allowed = if boundary == Turn && spacing == TranscriptSpacing::Spacious {
-                2
-            } else {
-                BLOCK_SEPARATOR_ROWS
-            };
-            assert!(
-                rows <= allowed,
-                "{boundary:?} at {spacing:?} spent {rows} rows (max {allowed})"
-            );
-        }
+        let rows = spacer_rows_for_boundary(boundary, TranscriptSpacing::Compact);
+        assert!(
+            rows <= BLOCK_SEPARATOR_ROWS,
+            "{boundary:?} at compact spent {rows} rows"
+        );
     }
 }
 
@@ -786,26 +884,26 @@ fn durable_work_starts_a_new_activity_rail_without_wasting_compact_rows() {
         "durable Work should open its own rail: {durable_work:?}"
     );
 
-    let mut comfortable = TranscriptViewCache::new();
-    comfortable.ensure(
+    let mut spacious = TranscriptViewCache::new();
+    spacious.ensure(
         &cells,
         &revisions,
         80,
         TranscriptRenderOptions {
-            spacing: TranscriptSpacing::Comfortable,
+            spacing: TranscriptSpacing::Spacious,
             low_motion: true,
             ..TranscriptRenderOptions::default()
         },
     );
     assert_eq!(
-        spacer_rows_after_cell(&comfortable, 0),
+        spacer_rows_after_cell(&spacious, 0),
         0,
         "two commands inside one activity rail must remain compact"
     );
     assert_eq!(
-        spacer_rows_after_cell(&comfortable, 1),
-        1,
-        "durable Work needs a semantic activity row outside compact density"
+        spacer_rows_after_cell(&spacious, 1),
+        2,
+        "durable Work needs a semantic activity break outside compact density"
     );
 }
 
@@ -899,7 +997,7 @@ fn hidden_reasoning_keeps_visible_rhythm_without_phantom_tail_rows() {
 
     cache.ensure(&cells, &revisions, 80, hidden);
     let hidden_lines = plain_lines(&cache);
-    assert_eq!(spacer_rows_after_cell(&cache, 0), 1);
+    assert_eq!(spacer_rows_after_cell(&cache, 0), 3);
     assert!(
         hidden_lines.last().is_some_and(|line| !line.is_empty()),
         "hidden cells must not leave a trailing blank row: {hidden_lines:?}"
@@ -942,7 +1040,7 @@ fn hidden_reasoning_cache_never_advertises_or_leaks_content() {
             Some(reasoning_owner(0)),
         );
         let text = plain_lines(&cache).join("\n");
-        assert_eq!(cache.reasoning_action_target(), None);
+        assert_eq!(cache.fold_action_target(), None);
         assert!(
             !text.contains("reasoning line"),
             "hidden body leaked: {text}"
@@ -970,30 +1068,38 @@ fn transcript_rhythm_is_width_and_reduced_motion_invariant() {
     ];
     let revisions = vec![1u64; cells.len()];
     // user | reasoning | answer | tool | work | answer | user.
-    // Every seam is one row: the reasoning→answer seam (index 1) used to be
-    // the one place the transcript ran two blocks together.
-    let expected = [1, 1, 1, 1, 1, 1, 0];
+    // Turn seams breathe widest; activity seams are the interior of one turn.
+    let expected_compact = [1, 0, 0, 0, 0, 1, 0];
+    let expected_spacious = [3, 2, 2, 2, 2, 3, 0];
 
     for width in [40, 80, 100, 140] {
         for low_motion in [false, true] {
-            let options = TranscriptRenderOptions {
-                low_motion,
-                spacing: TranscriptSpacing::Comfortable,
-                ..TranscriptRenderOptions::default()
-            };
-            let mut cache = TranscriptViewCache::new();
-            cache.ensure(&cells, &revisions, width, options);
+            for (spacing, expected) in [
+                (TranscriptSpacing::Compact, expected_compact),
+                (TranscriptSpacing::Spacious, expected_spacious),
+            ] {
+                let options = TranscriptRenderOptions {
+                    low_motion,
+                    spacing,
+                    ..TranscriptRenderOptions::default()
+                };
+                let mut cache = TranscriptViewCache::new();
+                cache.ensure(&cells, &revisions, width, options);
 
-            let actual =
-                std::array::from_fn::<_, 7, _>(|index| spacer_rows_after_cell(&cache, index));
-            assert_eq!(actual, expected, "width={width} low_motion={low_motion}");
-            assert!(
-                cache
-                    .lines()
-                    .iter()
-                    .all(|line| line.width() <= usize::from(width)),
-                "render exceeded width={width} low_motion={low_motion}"
-            );
+                let actual =
+                    std::array::from_fn::<_, 7, _>(|index| spacer_rows_after_cell(&cache, index));
+                assert_eq!(
+                    actual, expected,
+                    "width={width} low_motion={low_motion} spacing={spacing:?}"
+                );
+                assert!(
+                    cache
+                        .lines()
+                        .iter()
+                        .all(|line| line.width() <= usize::from(width)),
+                    "render exceeded width={width} low_motion={low_motion}"
+                );
+            }
         }
     }
 }
@@ -1026,17 +1132,18 @@ fn streaming_state_transitions_do_not_move_neighbor_boundaries() {
     };
 
     cache.ensure(&cells, &revisions, 80, options);
-    assert_eq!(boundary_rows(&cache), [1, 1, 1]);
+    let first = boundary_rows(&cache);
+    assert_eq!(first, [3, 2, 3]);
 
     cells[1] = assistant_cell("I inspected the candidate.", true);
     revisions[1] += 1;
     cache.ensure(&cells, &revisions, 80, options);
-    assert_eq!(boundary_rows(&cache), [1, 1, 1]);
+    assert_eq!(boundary_rows(&cache), first);
 
     cells[1] = assistant_cell("I inspected the candidate.", false);
     revisions[1] += 1;
     cache.ensure(&cells, &revisions, 80, options);
-    assert_eq!(boundary_rows(&cache), [1, 1, 1]);
+    assert_eq!(boundary_rows(&cache), first);
 
     let HistoryCell::Tool(ToolCell::Exec(exec)) = &mut cells[2] else {
         unreachable!("fixture is an exec tool")
@@ -1044,7 +1151,7 @@ fn streaming_state_transitions_do_not_move_neighbor_boundaries() {
     exec.status = ToolStatus::Success;
     revisions[2] += 1;
     cache.ensure(&cells, &revisions, 80, options);
-    assert_eq!(boundary_rows(&cache), [1, 1, 1]);
+    assert_eq!(boundary_rows(&cache), first);
 }
 
 #[test]
@@ -1524,7 +1631,7 @@ fn folded_thinking_cache_invalidation() {
     // Second render: fold the thinking cell → should invalidate and
     // produce fewer lines (collapsed summary).
     let mut folded = HashMap::new();
-    folded.insert(0usize, ThinkingFold::Collapsed);
+    folded.insert(0usize, TranscriptFold::Collapsed);
     cache.ensure_split(&[&cells], &revisions, width, options, &folded, None, None);
     let folded_line_count = cache.total_lines();
 
@@ -1595,7 +1702,7 @@ fn folded_thinking_with_collapsed_cells_uses_original_indices() {
     let index_map: Vec<usize> = vec![1]; // filtered 0 → original 1
 
     let mut folded = HashMap::new();
-    folded.insert(1usize, ThinkingFold::Collapsed); // fold original index 1
+    folded.insert(1usize, TranscriptFold::Collapsed); // fold original index 1
 
     let mut cache2 = TranscriptViewCache::new();
     cache2.ensure_split(
@@ -1972,10 +2079,10 @@ fn filtered_reasoning_owner_keeps_original_identity() {
     );
     assert!(plain_lines(&cache).join("\n").contains("Space:expand"));
     assert_eq!(
-        cache.reasoning_action_target(),
-        Some(ReasoningActionTarget {
+        cache.fold_action_target(),
+        Some(CellFoldActionTarget {
             owner: reasoning_owner(1),
-            action: ReasoningAction::Expand,
+            action: CellFoldAction::Expand,
         })
     );
     assert!(
@@ -1994,7 +2101,7 @@ fn filtered_reasoning_owner_keeps_original_identity() {
         Some(&original_map),
         Some(reasoning_owner(0)),
     );
-    assert!(cache.reasoning_action_target().is_none());
+    assert!(cache.fold_action_target().is_none());
     assert!(!plain_lines(&cache).join("\n").contains("Space:expand"));
 }
 
@@ -2023,7 +2130,7 @@ fn streaming_tail_fast_path_cannot_skip_reasoning_retarget() {
         None,
         None,
     );
-    assert!(cache.reasoning_action_target().is_none());
+    assert!(cache.fold_action_target().is_none());
     assert!(!plain_lines(&cache).join("\n").contains("Space:expand"));
 }
 
@@ -2207,5 +2314,493 @@ fn calm1_reasoning_header_hint_keeps_the_entire_live_tail_copyable() {
     assert!(cache.lines()[3].to_string().contains("reasoning line 20"));
     for index in 1..4 {
         assert!(cache.line_meta()[index].copy_prefix_width() < cache.lines()[index].width());
+    }
+}
+
+// ── Steady-state frames do no transcript work (#6652) ───────────────────────
+
+fn settled_transcript(turns: usize) -> (Vec<HistoryCell>, Vec<u64>) {
+    let cells = (0..turns)
+        .flat_map(|turn| {
+            [
+                user_cell(&format!("question {turn}")),
+                reasoning_cell(false),
+                assistant_cell(&format!("answer {turn}\n\n- one\n- two"), false),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let revisions = (1..=cells.len() as u64).collect();
+    (cells, revisions)
+}
+
+#[test]
+fn an_unchanged_frame_renders_and_moves_nothing() {
+    let (cells, revisions) = settled_transcript(400);
+    let options = TranscriptRenderOptions::default();
+    let ensure = |cache: &mut TranscriptViewCache| {
+        cache.ensure_split(
+            &[&cells],
+            &revisions,
+            80,
+            options,
+            &HashMap::new(),
+            None,
+            Some(reasoning_owner(1)),
+        );
+    };
+    let mut cache = TranscriptViewCache::new();
+    ensure(&mut cache);
+    let rendered = cache.cells_rendered;
+    let reflattened = cache.streaming_lines_reflattened();
+    let storage = cache.per_cell.as_ptr();
+    let line_arcs: Vec<_> = cache
+        .per_cell
+        .iter()
+        .map(|cell| Arc::as_ptr(&cell.lines))
+        .collect();
+
+    for _ in 0..5 {
+        ensure(&mut cache);
+    }
+
+    assert_eq!(cache.cells_rendered, rendered, "a settled frame rendered");
+    assert_eq!(cache.streaming_lines_reflattened(), reflattened);
+    assert_eq!(cache.per_cell.as_ptr(), storage, "cached cells were moved");
+    for (index, cell) in cache.per_cell.iter().enumerate() {
+        assert_eq!(Arc::as_ptr(&cell.lines), line_arcs[index], "cell {index}");
+    }
+}
+
+#[test]
+fn a_tail_only_change_renders_only_the_tail_in_place() {
+    let (mut cells, mut revisions) = settled_transcript(400);
+    cells.push(assistant_cell("streaming", true));
+    revisions.push(10_000);
+    let options = TranscriptRenderOptions {
+        low_motion: true,
+        ..TranscriptRenderOptions::default()
+    };
+    let ensure = |cache: &mut TranscriptViewCache, cells: &[HistoryCell], revisions: &[u64]| {
+        cache.ensure_split(
+            &[cells],
+            revisions,
+            80,
+            options,
+            &HashMap::new(),
+            None,
+            None,
+        );
+    };
+    let mut cache = TranscriptViewCache::new();
+    ensure(&mut cache, &cells, &revisions);
+    let storage = cache.per_cell.as_ptr();
+    let line_arcs: Vec<_> = cache
+        .per_cell
+        .iter()
+        .map(|cell| Arc::as_ptr(&cell.lines))
+        .collect();
+
+    for delta in 0..20u64 {
+        let before = cache.cells_rendered;
+        if let Some(HistoryCell::Assistant { content, .. }) = cells.last_mut() {
+            content.push_str(&format!(" delta {delta}"));
+        }
+        *revisions.last_mut().unwrap() += 1;
+        ensure(&mut cache, &cells, &revisions);
+        assert_eq!(cache.cells_rendered - before, 1, "delta {delta}");
+    }
+    assert_eq!(cache.per_cell.as_ptr(), storage, "cached cells were moved");
+    let settled = line_arcs.len() - 1;
+    for (index, cell) in cache.per_cell[..settled].iter().enumerate() {
+        assert_eq!(Arc::as_ptr(&cell.lines), line_arcs[index], "cell {index}");
+    }
+    let mut cold = TranscriptViewCache::new();
+    ensure(&mut cold, &cells, &revisions);
+    assert_same_flat_output(&cache, &cold);
+
+    // A change in the middle renders that cell and nothing after it.
+    let before = cache.cells_rendered;
+    cells[600] = assistant_cell("rewritten in place", false);
+    revisions[600] = 20_000;
+    ensure(&mut cache, &cells, &revisions);
+    assert_eq!(cache.cells_rendered - before, 1);
+    let mut cold = TranscriptViewCache::new();
+    ensure(&mut cold, &cells, &revisions);
+    assert_same_flat_output(&cache, &cold);
+}
+
+/// A filter can shift rows so that a tool cell's slot is taken by a streaming
+/// answer at an unchanged cell count. The answer takes the tail-only update,
+/// but the group rail and spacer between it and its neighbour belong to the
+/// neighbour's rows and must be rebuilt (found by the cold-render property
+/// test below).
+#[test]
+fn a_tool_slot_taken_by_a_streaming_answer_refreshes_its_neighbour() {
+    let options = TranscriptRenderOptions {
+        low_motion: true,
+        ..TranscriptRenderOptions::default()
+    };
+    let mut cells = vec![
+        user_cell("run it"),
+        exec_tool_cell("cargo check"),
+        exec_tool_cell("cargo test"),
+    ];
+    let mut revisions = vec![1u64, 2, 3];
+    let ensure = |cache: &mut TranscriptViewCache, cells: &[HistoryCell], revisions: &[u64]| {
+        cache.ensure_split(
+            &[cells],
+            revisions,
+            60,
+            options,
+            &HashMap::new(),
+            None,
+            None,
+        );
+    };
+    let mut cache = TranscriptViewCache::new();
+    ensure(&mut cache, &cells, &revisions);
+
+    cells[2] = assistant_cell("opening", true);
+    revisions[2] = 4;
+    ensure(&mut cache, &cells, &revisions);
+
+    let mut cold = TranscriptViewCache::new();
+    ensure(&mut cold, &cells, &revisions);
+    assert_same_flat_output(&cache, &cold);
+    assert!(
+        !plain_lines(&cache)
+            .iter()
+            .any(|line| line.starts_with('╭') || line.starts_with('╰')),
+        "{:?}",
+        plain_lines(&cache)
+    );
+}
+
+/// xorshift64*: a failing case prints its seed and step, so it replays.
+struct Xorshift(u64);
+
+impl Xorshift {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        (self.next() % bound as u64) as usize
+    }
+}
+
+/// What a live caller hands the cache, advanced the way `App` advances it:
+/// every mutation takes a fresh revision from one monotonic counter, active
+/// entries share the active revision, and a destructive edit moves the
+/// identity epoch.
+struct TranscriptModel {
+    cells: Vec<HistoryCell>,
+    revisions: Vec<u64>,
+    next_revision: u64,
+    active: Vec<HistoryCell>,
+    active_revision: u64,
+    folds: HashMap<usize, TranscriptFold>,
+    hidden: std::collections::HashSet<usize>,
+    width: u16,
+    options: TranscriptRenderOptions,
+    owner: Option<usize>,
+    epoch: u64,
+    serial: u64,
+}
+
+impl TranscriptModel {
+    fn new() -> Self {
+        Self {
+            cells: Vec::new(),
+            revisions: Vec::new(),
+            next_revision: 1,
+            active: Vec::new(),
+            active_revision: 0,
+            folds: HashMap::new(),
+            hidden: Default::default(),
+            width: 80,
+            // Motion is wall-clock driven; the comparison is between two
+            // renders taken at different instants.
+            options: TranscriptRenderOptions {
+                low_motion: true,
+                ..TranscriptRenderOptions::default()
+            },
+            owner: None,
+            epoch: 0,
+            serial: 0,
+        }
+    }
+
+    fn fresh_revision(&mut self) -> u64 {
+        self.next_revision += 1;
+        self.next_revision
+    }
+
+    fn random_cell(&mut self, rng: &mut Xorshift) -> HistoryCell {
+        self.serial += 1;
+        let serial = self.serial;
+        let prose = format!(
+            "{serial} {}",
+            "words that wrap at narrow widths and keep going ".repeat(1 + rng.below(4))
+        );
+        match rng.below(9) {
+            0 | 1 => user_cell(&prose),
+            2 => assistant_cell(&format!("{prose}\n\n- item {serial}\n- item"), false),
+            3 => assistant_cell(&prose, true),
+            4 => reasoning_cell(false),
+            5 => reasoning_cell(true),
+            6 => exec_tool_cell(&format!("cargo test {serial}")),
+            7 => exec_tool_cell_with_output(&format!("ls {serial}"), prose),
+            _ => durable_work_cell(),
+        }
+    }
+
+    fn mutate(&mut self, rng: &mut Xorshift) -> &'static str {
+        match rng.below(16) {
+            0..=3 => {
+                let cell = self.random_cell(rng);
+                let revision = self.fresh_revision();
+                self.cells.push(cell);
+                self.revisions.push(revision);
+                "append"
+            }
+            4 | 5 if !self.cells.is_empty() => {
+                let index = rng.below(self.cells.len());
+                self.cells[index] = self.random_cell(rng);
+                self.revisions[index] = self.fresh_revision();
+                "replace"
+            }
+            6 => {
+                // Stream into the newest cell the way the reply path does.
+                let revision = self.fresh_revision();
+                let streaming_tail = matches!(
+                    self.cells.last(),
+                    Some(HistoryCell::Assistant {
+                        streaming: true,
+                        ..
+                    })
+                );
+                if streaming_tail {
+                    if let Some(HistoryCell::Assistant { content, .. }) = self.cells.last_mut() {
+                        content.push_str(" more streamed words\n");
+                    }
+                    *self.revisions.last_mut().unwrap() = revision;
+                } else {
+                    self.cells.push(assistant_cell("opening ", true));
+                    self.revisions.push(revision);
+                }
+                "stream"
+            }
+            7 if !self.cells.is_empty() => {
+                let index = self.cells.len() - 1;
+                if let HistoryCell::Assistant { streaming, .. } = &mut self.cells[index] {
+                    *streaming = false;
+                    self.revisions[index] = self.fresh_revision();
+                }
+                "finish stream"
+            }
+            8 => {
+                self.active = (0..rng.below(4)).map(|_| self.random_cell(rng)).collect();
+                self.active_revision += 1;
+                "replace active"
+            }
+            9 if !self.cells.is_empty() => {
+                let index = rng.below(self.cells.len() + self.active.len());
+                match rng.below(3) {
+                    0 => self.folds.insert(index, TranscriptFold::Expanded),
+                    1 => self.folds.insert(index, TranscriptFold::Collapsed),
+                    _ => self.folds.remove(&index),
+                };
+                "fold"
+            }
+            10 => {
+                self.width = [24, 40, 80, 120][rng.below(4)];
+                "width"
+            }
+            11 => {
+                self.options.spacing =
+                    [TranscriptSpacing::Compact, TranscriptSpacing::Spacious][rng.below(2)];
+                self.options.show_thinking = rng.below(4) != 0;
+                "options"
+            }
+            12 if rng.below(4) == 0 => {
+                self.cells.clear();
+                self.revisions.clear();
+                self.folds.clear();
+                self.hidden.clear();
+                self.epoch += 1;
+                "clear"
+            }
+            13 if !self.cells.is_empty() => {
+                // Edit/undo: roll back to an earlier prefix.
+                let keep = rng.below(self.cells.len());
+                self.cells.truncate(keep);
+                self.revisions.truncate(keep);
+                self.folds.retain(|index, _| *index < keep);
+                self.hidden.retain(|index| *index < keep);
+                self.epoch += 1;
+                "truncate"
+            }
+            14 => {
+                let total = self.cells.len() + self.active.len();
+                if total > 0 {
+                    let index = rng.below(total);
+                    if !self.hidden.remove(&index) {
+                        self.hidden.insert(index);
+                    }
+                }
+                "hide"
+            }
+            15 => {
+                let total = self.cells.len() + self.active.len();
+                self.owner = (total > 0 && rng.below(3) != 0).then(|| rng.below(total));
+                "owner"
+            }
+            _ => "no-op",
+        }
+    }
+
+    /// One live frame: committed history plus the active tail, filtered when
+    /// the user has hidden cells, exactly as the chat widget assembles it.
+    fn frame(&self, cache: &mut TranscriptViewCache, owner: Option<usize>) {
+        let total = self.cells.len() + self.active.len();
+        let owner = owner
+            .filter(|index| *index < total)
+            .map(|cell_index| TranscriptActionOwner {
+                cell_index,
+                identity_epoch: self.epoch,
+            });
+        let active_revisions = (0..self.active.len()).map(|i| {
+            crate::tui::widgets::active_entry_revision(self.active_revision, i as u64 + 1)
+        });
+        if self.hidden.is_empty() {
+            let revisions: Vec<u64> = self
+                .revisions
+                .iter()
+                .copied()
+                .chain(active_revisions)
+                .collect();
+            cache.ensure_split(
+                &[&self.cells, &self.active],
+                &revisions,
+                self.width,
+                self.options,
+                &self.folds,
+                None,
+                owner,
+            );
+            return;
+        }
+        let revisions: Vec<u64> = self
+            .revisions
+            .iter()
+            .copied()
+            .chain(active_revisions)
+            .collect();
+        let mut kept = Vec::new();
+        let mut kept_revisions = Vec::new();
+        let mut map = Vec::new();
+        for (index, cell) in self.cells.iter().chain(&self.active).enumerate() {
+            if !self.hidden.contains(&index) {
+                kept.push(cell);
+                kept_revisions.push(revisions[index]);
+                map.push(index);
+            }
+        }
+        cache.ensure_filtered(
+            &kept,
+            &kept_revisions,
+            self.width,
+            self.options,
+            &self.folds,
+            Some(&map),
+            owner,
+        );
+    }
+}
+
+/// After every mutation, the incrementally maintained cache must equal one
+/// built from scratch from the same state: the early-out and in-place update
+/// may change how much work a frame does, never what it shows.
+#[test]
+fn cached_transcript_matches_a_cold_render_after_every_mutation() {
+    for seed in 1..=8u64 {
+        let mut rng = Xorshift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut model = TranscriptModel::new();
+        let mut warm = TranscriptViewCache::new();
+        let mut log = Vec::new();
+        for step in 0..150 {
+            let op = model.mutate(&mut rng);
+            log.push(op);
+            let context = || format!("seed {seed} step {step}: {}", log.join(", "));
+
+            let owner = model.owner;
+            model.frame(&mut warm, owner);
+            let mut cold = TranscriptViewCache::new();
+            model.frame(&mut cold, owner);
+            assert_eq!(warm.lines(), cold.lines(), "{}", context());
+            assert_eq!(warm.line_links(), cold.line_links(), "{}", context());
+            assert_eq!(warm.line_meta(), cold.line_meta(), "{}", context());
+            assert_eq!(
+                warm.rail_prefix_widths,
+                cold.rail_prefix_widths,
+                "{}",
+                context()
+            );
+            assert_eq!(
+                warm.cell_line_starts,
+                cold.cell_line_starts,
+                "{}",
+                context()
+            );
+            assert_eq!(
+                warm.fold_action_target(),
+                cold.fold_action_target(),
+                "{}",
+                context()
+            );
+
+            // The same inputs again are a settled frame: no render, no rows
+            // re-flattened, identical output.
+            let rendered = warm.cells_rendered;
+            let reflattened = warm.streaming_lines_reflattened();
+            model.frame(&mut warm, owner);
+            assert_eq!(warm.cells_rendered, rendered, "{}", context());
+            assert_eq!(
+                warm.streaming_lines_reflattened(),
+                reflattened,
+                "{}",
+                context()
+            );
+            assert_eq!(warm.lines(), cold.lines(), "{}", context());
+
+            // A scroll frame retargets the hint after layout.
+            if rng.below(3) == 0 {
+                let total = model.cells.len() + model.active.len();
+                let retarget = (total > 0).then(|| rng.below(total));
+                let map: Vec<usize> = (0..total).filter(|i| !model.hidden.contains(i)).collect();
+                let index_map = (!model.hidden.is_empty()).then_some(map.as_slice());
+                let epoch = model.epoch;
+                warm.retarget(
+                    retarget.map(|cell_index| TranscriptActionOwner {
+                        cell_index,
+                        identity_epoch: epoch,
+                    }),
+                    index_map,
+                );
+                let mut cold = TranscriptViewCache::new();
+                model.frame(&mut cold, retarget);
+                assert_eq!(warm.lines(), cold.lines(), "retarget; {}", context());
+                assert_eq!(
+                    warm.line_meta(),
+                    cold.line_meta(),
+                    "retarget; {}",
+                    context()
+                );
+            }
+        }
     }
 }

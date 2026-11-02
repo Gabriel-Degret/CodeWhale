@@ -4,7 +4,7 @@ use super::{
     build_model_tool_catalog_with_surface, default_synthetic_catalog_tool_names,
     ensure_advanced_tooling, execute_tool_search_with_cache, initial_active_tools,
     is_synthetic_catalog_tool, remove_evicted_cache_activations, requested_tool_mode,
-    tool_matches_any_rule, touch_cached_tool_after_execution,
+    tool_matches_any_rule,
 };
 use crate::core::session::ToolActivationCache;
 use codewhale_config::AppMode;
@@ -26,14 +26,41 @@ fn tool(name: &str) -> Tool {
     }
 }
 
-/// `code_execution` writes the script to a tempdir and runs it as a plain
-/// child process in the workspace — no seccomp, no jail, no container. The
-/// description is model-facing, so calling it a sandbox would tell the model
-/// it has isolation the runtime never provides.
+/// The shared launcher applies policy only where enforcement is available.
+/// The model-facing description must not promise unconditional isolation.
 #[test]
 fn code_execution_description_does_not_claim_process_sandboxing() {
     assert!(CODE_EXECUTION_DESCRIPTION.contains("local Python interpreter"));
     assert!(!CODE_EXECUTION_DESCRIPTION.contains("sandbox"));
+}
+
+/// Python output must match our UTF-8 decoder even with non-UTF-8 parent stdio.
+#[tokio::test]
+async fn code_execution_returns_utf8_stdout_and_stderr() {
+    use crate::dependencies::ExternalTool as _;
+    use crate::test_support::{EnvVarGuard, lock_test_env};
+
+    let _env_lock = lock_test_env();
+    if !crate::dependencies::Python::available() {
+        return;
+    }
+    let _encoding = EnvVarGuard::set("PYTHONIOENCODING", "gbk");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let result = super::execute_code_execution_tool(
+        &json!({"code": r#"import sys; print("\u4e2d\u6587"); print("\u9519\u8bef", file=sys.stderr)"#}),
+        tmp.path(),
+        &crate::tools::spec::ToolContext::new(tmp.path()),
+    )
+    .await
+    .expect("code execution should run");
+    let payload = result.metadata.expect("payload");
+    assert_eq!(
+        (
+            payload["stdout"].as_str().map(str::trim_end),
+            payload["stderr"].as_str().map(str::trim_end),
+        ),
+        (Some("中文"), Some("错误")),
+    );
 }
 
 /// The published synthetic-name list and the predicate that classifies a
@@ -76,6 +103,7 @@ fn first_turn_surface_is_stable_across_plan_work_and_operate() {
             "read",
             "write",
             "edit",
+            "file_search",
             "bash",
             "agent",
             "workflow",
@@ -83,6 +111,7 @@ fn first_turn_surface_is_stable_across_plan_work_and_operate() {
             "create_goal",
             "get_goal",
             "update_goal",
+            "task_shell_wait",
             "load_skill"
         ]
     );
@@ -93,8 +122,10 @@ fn first_turn_surface_is_stable_across_plan_work_and_operate() {
         "get_goal",
         "update_goal",
         "edit",
+        "file_search",
         "load_skill",
         "read",
+        "task_shell_wait",
         "todo_write",
         "tool_search",
         "workflow",
@@ -109,6 +140,7 @@ fn first_turn_surface_is_stable_across_plan_work_and_operate() {
             "read",
             "write",
             "edit",
+            "file_search",
             "bash",
             "agent",
             "workflow",
@@ -116,6 +148,7 @@ fn first_turn_surface_is_stable_across_plan_work_and_operate() {
             "create_goal",
             "get_goal",
             "update_goal",
+            "task_shell_wait",
             "Git",
             "Run",
             "tasks",
@@ -229,24 +262,17 @@ fn successful_cached_execution_updates_lru_without_granting_uncached_names() {
     let delta = cache.activate(&catalog, &first);
     active.extend(delta.admitted);
 
-    assert!(touch_cached_tool_after_execution(
-        &catalog,
-        &mut active,
-        &mut cache,
-        "deferred-0"
-    ));
+    assert!(cache.record_use("deferred-7"));
     let delta = cache.activate(&catalog, &["deferred-8".to_string()]);
     remove_evicted_cache_activations(&catalog, &mut active, delta.evicted);
     active.extend(delta.admitted);
+    // The batch is ranked best-first; using its oldest retained match
+    // promotes it ahead of the next batch without granting an unseen tool.
+    assert!(cache.names().any(|name| name == "deferred-7"));
     assert!(cache.names().any(|name| name == "deferred-0"));
-    assert!(!cache.names().any(|name| name == "deferred-1"));
+    assert!(!cache.names().any(|name| name == "deferred-6"));
 
-    assert!(!touch_cached_tool_after_execution(
-        &catalog,
-        &mut active,
-        &mut cache,
-        "never-activated"
-    ));
+    assert!(!cache.record_use("never-activated"));
     assert!(!active.contains("never-activated"));
 }
 
@@ -441,7 +467,8 @@ async fn dropped_code_execution_kills_the_interpreter_tree() {
         pid_file.display().to_string()
     );
     let input = json!({ "code": code });
-    let run = super::execute_code_execution_tool(&input, tmp.path());
+    let context = crate::tools::spec::ToolContext::new(tmp.path());
+    let run = super::execute_code_execution_tool(&input, tmp.path(), &context);
     let grandchild = crate::process_tree::drop_once_pid_written(run, &pid_file).await;
     assert!(
         crate::process_tree::wait_for_pid_exit(grandchild, std::time::Duration::from_secs(5)),

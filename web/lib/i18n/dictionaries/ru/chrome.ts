@@ -19,6 +19,7 @@ export const chrome: ChromeDict = {
   navCommunity: "Сообщество",
   navContribute: "Участие",
 
+  navFeatures: "Возможности",
   navProduct: "Продукт",
   navModels: "Модели",
   navPlugins: "Плагины",
@@ -29,8 +30,6 @@ export const chrome: ChromeDict = {
   navHomeAria: "Главная Codewhale",
 
   installCta: "Установить →",
-
-  authSignIn: "Войти",
 
   dateLocale: "ru-RU",
 
@@ -44,7 +43,7 @@ export const chrome: ChromeDict = {
   themeTitle: "Тема · авто / светлая / тёмная",
 
   footerTagline:
-    "Создавайте то, что хотите, и автоматизируйте повседневную работу с помощью выбранных вами моделей.",
+    "Агент для программирования с открытым кодом для вашего терминала и выбранных вами моделей.",
   footerProduct: "Продукт",
   footerProject: "Проект",
   footerDocs: "Документация",

@@ -15,8 +15,8 @@ Codewhale 可以执行由模型提出的 shell 命令。审批策略、感知工
 | 机制 | 平台 | 选择方式 | Codewhale 报告的结果 |
 |---|---|---|---|
 | Seatbelt（`sandbox-exec`） | macOS | 运行时探测成功时自动启用 | `macos-seatbelt` |
-| Bubblewrap（`/usr/bin/bwrap`） | Linux | `prefer_bwrap = true` 且该文件可执行 | `linux-bwrap` |
-| 无操作系统包装器 | Linux，没有可用且已启用的 bwrap | 默认 | `none` |
+| Bubblewrap（`/usr/bin/bwrap`） | Linux | 默认启用，前提是已安装且探测包装运行成功；`prefer_bwrap = false` 可退出 | `linux-bwrap` |
+| 无操作系统包装器 | Linux，bwrap 不可用或已退出 | `prefer_bwrap = false`，或 bwrap 不存在/不可用 | `none` |
 | 无操作系统包装器 | Windows | 当前实现 | `none` |
 | 兼容 OpenSandbox 的服务 | 任何受支持的主机 | `sandbox_backend = "opensandbox"` | 外部执行路径 |
 
@@ -34,20 +34,26 @@ Seatbelt profile。
 
 - 大范围的文件系统读取；
 - 写入受所选策略限制，范围包括工作区，以及受支持工具所需的特定运行时/缓存路径；
-- 只有在策略允许时才放开网络访问。
+- 只有在策略允许时才放开网络访问。带网络的 `read-only` 策略（智能体的
+  `read_only: true` shell 模式）只获得出站 IPv4 和系统 DNS 解析器。IPv6 以及本机
+  自己的地址（包括回环地址）都被拒绝，只有 `HTTP_PROXY`、`HTTPS_PROXY` 或
+  `ALL_PROXY` 指定的本地代理服务器端口例外；其他本地套接字仍被拒绝。
 
 探测失败，或 `sandbox-exec` 不可用时，Codewhale 会报告未启用操作系统沙箱，
 直接启动命令，不套 Seatbelt 包装器。这条回退路径上也不会打任何 Seatbelt 标记。
 
-## Linux：需要主动启用的 bubblewrap
+## Linux：默认启用的 bubblewrap
 
-Linux 下的命令沙箱需要主动启用。设置顶层配置项：
+只要 bubblewrap 可用，Linux 下的命令沙箱默认启用。退出使用顶层配置项：
 
 ```toml
-prefer_bwrap = true
+prefer_bwrap = false
 ```
 
-只有当 `/usr/bin/bwrap` 是普通的可执行文件时，Codewhale 才会选用 bubblewrap。
+只有当 `/usr/bin/bwrap` 是普通的可执行文件，且一次实际的包装探测运行证明
+它能在这台主机上创建命名空间时，Codewhale 才会选用 bubblewrap —— 仅有可执行
+位会骗人：在限制用户命名空间的主机上（例如开启了 `kernel.apparmor_restrict_unprivileged_userns`
+的 Ubuntu 24.04），每条被包装的命令都会失败，而不是以未沙箱化方式运行。
 包装器根据解析后的 `SandboxPolicy` 推导自己的挂载点和网络命名空间：
 
 ```text
@@ -81,14 +87,17 @@ prefer_bwrap = true
 
 在 `read-only` 下没有任何可写绑定，所以工作目录仍留在只读根视图里。
 `--unshare-all` 默认隔离网络命名空间；只有当策略中的 `network_access` 为 true
-时，Codewhale 才补上 `--share-net`。`danger-full-access` 和 `external-sandbox`
+时，Codewhale 才补上 `--share-net`。智能体的 `read_only: true` shell 模式只在 Full
+Access（完全访问）下开启网络（见 [子智能体](SUBAGENTS.md)）；此时它与联网的
+`workspace-write` shell 一样共享主机网络命名空间，包括回环地址和抽象 unix 套接字，
+bubblewrap 对两者都不做过滤。`danger-full-access` 和 `external-sandbox`
 完全绕过本地包装器。
 
-如果用户没有主动启用，或者 `/usr/bin/bwrap` 不存在、不可执行，Codewhale 会
-报告 `none`，直接启动命令，不带任何 Linux 操作系统包装器。这里没有回退做法：
-不会只打个标记，就把它当成另一种 Linux 沙箱。
+如果用户选择退出，或者 `/usr/bin/bwrap` 不存在、不可执行、或实际上无法
+限制子进程，Codewhale 会报告 `none`，直接启动命令，不带任何 Linux 操作
+系统包装器。这里没有回退做法：不会只打个标记，就把它当成另一种 Linux 沙箱。
 
-如果这套主动启用的方案适合你的工作流，请另行安装 bubblewrap：
+在 Linux 上获得强制力，请另行安装 bubblewrap：
 
 - Ubuntu/Debian：`apt install bubblewrap`
 - Fedora：`dnf install bubblewrap`
@@ -151,6 +160,10 @@ sandbox_mode = "workspace-write" # read-only | workspace-write | danger-full-acc
 
 - 只有当对应的包装器被选中且可用时，`read-only` 和 `workspace-write` 才由
   Seatbelt 或 bubblewrap 强制执行。
+- 配置值只能收窄权限模式选定的沙箱：Full Access（`yolo`）不套包装器，Ask 和
+  Auto-Review 使用 `workspace-write`，Plan 使用 `read-only`。因此配置的
+  `danger-full-access` 或 `external-sandbox` 只在 Full Access 下生效，绝不会放宽
+  Ask 或 Auto-Review。
 - `danger-full-access` 有意绕过本地操作系统包装器。在 Linux 上，它还会在启动时
   跳过 `PR_SET_NO_NEW_PRIVS` 进程加固标志，让 `sudo`/setuid 工作流继续可用
   （#5723）；见上面的进程加固一节。
@@ -165,7 +178,8 @@ sandbox_mode = "workspace-write" # read-only | workspace-write | danger-full-acc
 - `CODEWHALE_SANDBOX_URL`
 - `CODEWHALE_SANDBOX_API_KEY`
 
-不存在 `CODEWHALE_PREFER_BWRAP` 环境变量覆盖；请使用顶层的 `prefer_bwrap` 配置项。
+`CODEWHALE_PREFER_BWRAP`（旧别名 `DEEPSEEK_PREFER_BWRAP`）可显式覆盖此偏好；
+顶层 `prefer_bwrap` 配置项是持久设置。
 
 ## 诊断与失败归因
 

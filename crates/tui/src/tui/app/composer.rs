@@ -712,6 +712,10 @@ impl ComposerState {
 
 impl App {
     pub fn insert_str(&mut self, text: &str) {
+        self.insert_str_with_raw_mouse_recovery(text, true);
+    }
+
+    fn insert_str_with_raw_mouse_recovery(&mut self, text: &str, recover_raw_mouse: bool) {
         if text.is_empty() {
             return;
         }
@@ -727,7 +731,9 @@ impl App {
         self.input.insert_str(byte_index, text);
         self.resync_command_line_claim();
         self.cursor_position = cursor + char_count(text);
-        self.strip_raw_mouse_reports_from_input();
+        if recover_raw_mouse {
+            self.strip_raw_mouse_reports_from_input();
+        }
         self.slash_menu_hidden = false;
         self.mention_menu_hidden = false;
         self.mention_menu_selected = 0;
@@ -738,9 +744,13 @@ impl App {
         if let Some(pending) = self.paste_burst.flush_before_modified_input() {
             self.insert_str(&pending);
         }
+        if self.attach_pasted_image_paths(text) {
+            self.paste_burst.clear_after_explicit_paste();
+            return;
+        }
         let normalized = normalize_paste_text(text);
         if !normalized.is_empty() {
-            self.insert_str(&normalized);
+            self.insert_str_with_raw_mouse_recovery(&normalized, false);
         }
         self.paste_burst.clear_after_explicit_paste();
         // Large pasted input stays editable and visible until submit. The
@@ -748,6 +758,32 @@ impl App {
         // an @paste-...md mention before dispatch, so no path silently
         // truncates user input.
         // self.consolidate_large_input_if_oversized(); // deferred to submit time
+    }
+
+    /// A file dragged onto the terminal arrives as a paste of its path. When
+    /// the whole paste names local image files, attach them on the same
+    /// `[Attached image: …]` line a clipboard image gets, so each shows as a
+    /// composer attachment and is sent to the model as an image part (the
+    /// engine expands the line when it builds the user message, and the
+    /// route's vision capability decides per request; a text-only route gets
+    /// the omission notice there). Returns whether the paste was consumed.
+    ///
+    /// A command line (`/…`) or shell line (`!…`) keeps the literal path.
+    pub(crate) fn attach_pasted_image_paths(&mut self, text: &str) -> bool {
+        if self.input.trim_start().starts_with(['/', '!']) {
+            return false;
+        }
+        let Some(paths) = crate::image_attach::pasted_image_paths(text) else {
+            return false;
+        };
+        for path in &paths {
+            self.insert_media_attachment("image", path, None);
+        }
+        self.status_message = Some(match paths.as_slice() {
+            [path] => format!("Attached image: {}", path.display()),
+            paths => format!("Attached {} images", paths.len()),
+        });
+        true
     }
 
     pub fn insert_media_attachment(&mut self, kind: &str, path: &Path, description: Option<&str>) {
@@ -1699,6 +1735,20 @@ impl App {
         // bytes lost after the composer accepted them — never fall through
         // to the prose-prompt branch; hold it instead.
         let claimed_command = self.command_line_claimed();
+        // A dropped image path that was not converted at paste time (typed
+        // keys, or the question written on the same line) still attaches.
+        if !claimed_command
+            && !self.input.trim_start().starts_with('!')
+            && let Some((path, rest)) = crate::image_attach::leading_dropped_image(&self.input)
+        {
+            let reference = media_attachment_reference("image", &path, None);
+            self.input = if rest.is_empty() {
+                reference
+            } else {
+                format!("{reference}\n{rest}")
+            };
+            self.cursor_position = char_count(&self.input);
+        }
         // Safety net: if any earlier path filled the buffer above the
         // safety cap without going through `insert_paste_text`, fold it
         // into a workspace paste file now (#553). Bracketed pastes hit
@@ -1956,11 +2006,26 @@ impl App {
         let file_path = self.workspace.join(&rel_path);
         let written = crate::fs_confined::write(&self.workspace, &file_path, self.input.as_bytes());
         if let Err(error) = written {
+            let limit = MAX_SUBMITTED_INPUT_CHARS.to_string();
+            // The toast row sheds clauses to fit and left only "Not sent", so
+            // the toast carries a short form and the full reason, including
+            // the write error, goes to the transcript where nothing is clipped.
+            let short = self
+                .tr(MessageId::ComposerOversizedSubmitHeldShort)
+                .replace("{limit}", &limit);
             let reason = self
                 .tr(MessageId::ComposerOversizedSubmitHeld)
-                .replace("{limit}", &MAX_SUBMITTED_INPUT_CHARS.to_string())
+                .replace("{limit}", &limit)
                 .replace("{error}", &error.to_string());
-            self.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+            self.push_status_toast(short, StatusToastLevel::Error, Some(8_000));
+            // Enter and paste both retry this; do not stack identical cells.
+            let already_noted = matches!(
+                self.history.last(),
+                Some(HistoryCell::System { content }) if *content == reason
+            );
+            if !already_noted {
+                self.add_message(HistoryCell::System { content: reason });
+            }
             self.needs_redraw = true;
             return false;
         }

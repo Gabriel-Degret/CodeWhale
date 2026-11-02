@@ -17,7 +17,8 @@ use std::io;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
@@ -42,12 +43,14 @@ use windows::Win32::System::JobObjects::{
 use windows::core::PCWSTR;
 
 #[cfg(not(target_env = "ohos"))]
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{PtySize, native_pty_system};
 
 mod guidance;
 mod output;
 
-use super::shell_output::{summarize_output, truncate_with_meta};
+use super::shell_output::{
+    kill_outcome_note, output_phase_hint, summarize_output, truncate_with_meta,
+};
 use crate::child_env;
 use crate::sandbox::{
     CommandSpec,
@@ -1000,7 +1003,7 @@ fn shared_output_pipe() -> io::Result<(File, File, File)> {
 }
 
 const SYNC_READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const STALE_NO_OUTPUT_AFTER: Duration = Duration::from_secs(60);
+pub(crate) const QUIET_NO_OUTPUT_AFTER: Duration = Duration::from_secs(60);
 
 /// Grace between SIGTERM and SIGKILL on the shell kill path (timeout,
 /// cancel, drop). Bounded so a SIGTERM-ignoring command is force-killed
@@ -1583,6 +1586,9 @@ impl BackgroundShell {
 
     /// Kill the process
     fn kill(&mut self) -> Result<()> {
+        if self.poll() && self.status != ShellStatus::Running {
+            return Ok(());
+        }
         #[cfg(unix)]
         if self.ownership == ShellOwnership::PersistPending
             && let Some(process_group_id) = self.child.as_ref().and_then(ShellChild::process_id)
@@ -1711,13 +1717,6 @@ impl BackgroundShell {
             .unwrap_or((0, String::new()));
         let elapsed_since_output_ms = (self.status == ShellStatus::Running)
             .then(|| u64::try_from(self.last_output_at.elapsed().as_millis()).unwrap_or(u64::MAX));
-        // A live PTY can wait indefinitely for input. Silence does not mean it
-        // lost its process owner; marking it stale hides its transport from API
-        // clients and incorrectly prevents reconnect/resize after one minute.
-        let stale = self.terminal_size.is_none()
-            && elapsed_since_output_ms.is_some_and(|elapsed| {
-                elapsed >= u64::try_from(STALE_NO_OUTPUT_AFTER.as_millis()).unwrap_or(u64::MAX)
-            });
         ShellJobSnapshot {
             id: self.id.clone(),
             job_id: self.id.clone(),
@@ -1733,7 +1732,7 @@ impl BackgroundShell {
             stdout_len,
             stderr_len,
             stdin_available: self.stdin.is_some() && self.status == ShellStatus::Running,
-            stale,
+            stale: false,
             elapsed_since_output_ms,
             linked_task_id: self.linked_task_id.clone(),
             owner_agent_id: self
@@ -1933,7 +1932,9 @@ pub struct ShellManager {
     default_workspace: PathBuf,
     sandbox_manager: SandboxManager,
     sandbox_policy: ExecutionSandboxPolicy,
-    foreground_background_requested: bool,
+    /// Only live wait futures hold strong references. A request cannot survive
+    /// completion/cancellation and release a later wait or another session.
+    active_waits: Vec<(String, Weak<AtomicBool>)>,
     /// Directory for lowercase-`bash` complete-output spill files
     /// (`None` = process temp dir). Overridable so tests can fault-inject a
     /// missing/unwritable spill location.
@@ -1948,8 +1949,12 @@ impl std::fmt::Debug for ShellManager {
             .field("default_workspace", &self.default_workspace)
             .field("sandbox_policy", &self.sandbox_policy)
             .field(
-                "foreground_background_requested",
-                &self.foreground_background_requested,
+                "active_waits",
+                &self
+                    .active_waits
+                    .iter()
+                    .filter(|(_, wait)| wait.strong_count() > 0)
+                    .count(),
             )
             .finish()
     }
@@ -1978,7 +1983,7 @@ impl ShellManager {
             default_workspace: workspace,
             sandbox_manager: SandboxManager::new(),
             sandbox_policy: ExecutionSandboxPolicy::default(),
-            foreground_background_requested: false,
+            active_waits: Vec::new(),
             output_spill_dir: None,
         }
     }
@@ -2089,7 +2094,7 @@ impl ShellManager {
     /// Prepare a program for a tool that runs workspace code outside
     /// `exec_shell`, under the policy and sandbox configuration a shell
     /// command would get in this session.
-    fn prepare_runner(
+    pub(crate) fn prepare_runner(
         &self,
         program: &str,
         args: Vec<String>,
@@ -2103,28 +2108,42 @@ impl ShellManager {
         self.sandbox_manager.prepare(&spec)
     }
 
-    /// Request that the active foreground shell wait detach and leave its
-    /// process running in the background job table.
-    pub fn request_foreground_background(&mut self) {
-        self.foreground_background_requested = true;
+    fn register_shell_wait(&mut self, session_id: &str) -> Arc<AtomicBool> {
+        self.active_waits
+            .retain(|(_, wait)| wait.strong_count() > 0);
+        let detach = Arc::new(AtomicBool::new(false));
+        self.active_waits
+            .push((session_id.to_string(), Arc::downgrade(&detach)));
+        detach
+    }
+
+    /// Release the owning session's currently active shell waits without
+    /// stopping their processes. This never queues a request for future work.
+    pub(crate) fn request_shell_wait_detach(&mut self, session_id: &str) -> bool {
+        let mut requested = false;
+        self.active_waits.retain(|(owner, wait)| {
+            let Some(wait) = wait.upgrade() else {
+                return false;
+            };
+            if !session_id.is_empty() && owner == session_id {
+                wait.store(true, Ordering::Release);
+                requested = true;
+            }
+            true
+        });
+        requested
     }
 
     #[cfg(test)]
-    pub(crate) fn foreground_background_requested_for_test(&self) -> bool {
-        self.foreground_background_requested
+    pub(crate) fn shell_wait_active_for_test(&self, session_id: &str) -> bool {
+        self.active_waits
+            .iter()
+            .any(|(owner, wait)| owner == session_id && wait.strong_count() > 0)
     }
 
-    fn clear_foreground_background_request(&mut self) {
-        self.foreground_background_requested = false;
-    }
-
-    fn take_foreground_background_request(&mut self, task_id: &str) -> bool {
-        let requested = self.foreground_background_requested;
-        self.foreground_background_requested = false;
-        if requested && let Some(shell) = self.processes.get_mut(task_id) {
-            shell.background = true;
-        }
-        requested
+    #[cfg(test)]
+    pub(crate) fn register_shell_wait_for_test(&mut self, session_id: &str) -> Arc<AtomicBool> {
+        self.register_shell_wait(session_id)
     }
 
     /// Execute a shell command with stdin/TTY options plus an extra env-var map
@@ -2316,7 +2335,7 @@ impl ShellManager {
         };
         let spec = spec.with_policy(policy).with_env(extra_env);
         let exec_env = self.sandbox_manager.prepare(&spec);
-        if matches!(spec.sandbox_policy, ExecutionSandboxPolicy::ReadOnly)
+        if matches!(spec.sandbox_policy, ExecutionSandboxPolicy::ReadOnly { .. })
             && readonly_workspace.is_none()
         {
             // Arbitrary code with a read-only policy needs kernel enforcement;
@@ -2385,6 +2404,9 @@ impl ShellManager {
             .with_policy(policy)
             .with_env(extra_env);
         let exec_env = self.sandbox_manager.prepare(&spec);
+        if matches!(spec.sandbox_policy, ExecutionSandboxPolicy::ReadOnly { .. }) {
+            require_native_readonly_execution(&exec_env)?;
+        }
 
         Self::execute_interactive_sandboxed(command, &work_dir, timeout_ms, &exec_env)
     }
@@ -2730,18 +2752,9 @@ impl ShellManager {
                     })
                     .context("Failed to open PTY")?;
 
-                let mut cmd = CommandBuilder::new(program);
-                for arg in args {
-                    cmd.arg(arg);
-                }
-                cmd.cwd(working_dir);
-                child_env::apply_to_pty_command(&mut cmd, child_env::string_map_env(&exec_env.env));
-
-                let mut child = pair
-                    .slave
-                    .spawn_command(cmd)
+                let mut child = exec_env
+                    .spawn_pty(pair.slave, working_dir)
                     .with_context(|| format!("Failed to spawn PTY command: {original_command}"))?;
-                drop(pair.slave);
 
                 let reader = match pair.master.try_clone_reader() {
                     Ok(reader) => reader,
@@ -2788,7 +2801,7 @@ impl ShellManager {
             child_env::apply_to_command(&mut cmd, child_env::string_map_env(&exec_env.env));
             remove_readonly_redirect_env(&mut cmd, &exec_env.env);
 
-            let child = cmd.spawn().with_context(|| {
+            let child = exec_env.spawn_background(cmd).with_context(|| {
                 format!("Failed to spawn persistent service: {original_command}")
             })?;
             (ShellChild::Process(child), None, None, None)
@@ -2814,8 +2827,8 @@ impl ShellManager {
             child_env::apply_to_command(&mut cmd, child_env::string_map_env(&exec_env.env));
             remove_readonly_redirect_env(&mut cmd, &exec_env.env);
 
-            let mut child = cmd
-                .spawn()
+            let mut child = exec_env
+                .spawn_background(cmd)
                 .with_context(|| format!("Failed to spawn background: {original_command}"))?;
             // Managed children die with the TUI (#6654); unlike the
             // persistent branch above, nobody can take ownership of them.
@@ -3101,19 +3114,9 @@ impl ShellManager {
             .processes
             .get_mut(task_id)
             .ok_or_else(|| anyhow!("Task {task_id} not found"))?;
-
-        if wait && shell.status == ShellStatus::Running {
-            let timeout = Duration::from_millis(timeout_ms.clamp(1000, 600_000));
-            let deadline = Instant::now() + timeout;
-
-            while shell.status == ShellStatus::Running && Instant::now() < deadline {
-                if shell.poll() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        } else {
-            shell.poll();
+        wait_while_running(shell, wait, timeout_ms);
+        if shell.status != ShellStatus::Running && shell.owner_agent.is_some() {
+            shell.completion_reported = true;
         }
 
         let (
@@ -3168,6 +3171,25 @@ impl ShellManager {
         Ok(())
     }
 
+    pub fn last_output_age_ms(&self, task_id: &str) -> Option<u64> {
+        let shell = self.processes.get(task_id)?;
+        Some(u64::try_from(shell.last_output_at.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+
+    pub fn running_progress(&mut self, task_id: &str) -> Option<String> {
+        let shell = self.processes.get_mut(task_id)?;
+        shell.poll();
+        if shell.status != ShellStatus::Running {
+            return None;
+        }
+        let job = shell.job_snapshot();
+        let quiet_secs = shell.last_output_at.elapsed().as_secs();
+        Some(format!(
+            "Progress: last output {quiet_secs}s ago; {}.",
+            output_phase_hint(&format!("{}\n{}", job.stdout_tail, job.stderr_tail))
+        ))
+    }
+
     /// Kill a running background process
     pub fn kill(&mut self, task_id: &str) -> Result<ShellResult> {
         let shell = self
@@ -3177,6 +3199,17 @@ impl ShellManager {
 
         shell.kill()?;
         shell.snapshot()
+    }
+
+    pub(crate) fn mark_cancel_reported(&mut self, result: &ShellResult) {
+        if result.status == ShellStatus::Killed
+            && let Some(shell) = result
+                .task_id
+                .as_deref()
+                .and_then(|id| self.processes.get_mut(id))
+        {
+            shell.completion_reported = true;
+        }
     }
 
     pub fn kill_for_session(
@@ -3211,18 +3244,20 @@ impl ShellManager {
     ) -> Result<Vec<ShellResult>> {
         let ids = self
             .processes
-            .iter()
+            .iter_mut()
             .filter(|(_, shell)| {
-                shell.status == ShellStatus::Running
-                    && !active_session_id.is_empty()
-                    && shell.owner_session_id == active_session_id
+                !active_session_id.is_empty() && shell.owner_session_id == active_session_id
             })
-            .map(|(id, _)| id.clone())
+            .filter_map(|(id, shell)| {
+                shell.poll();
+                (shell.status == ShellStatus::Running).then(|| id.clone())
+            })
             .collect::<Vec<_>>();
         let mut results = Vec::with_capacity(ids.len());
         for id in ids {
             results.push(self.kill(&id)?);
         }
+        results.retain(|result| result.status == ShellStatus::Killed);
         Ok(results)
     }
 
@@ -3314,17 +3349,6 @@ impl ShellManager {
         wait: bool,
         timeout_ms: u64,
     ) -> Result<ShellDeltaResult> {
-        self.get_output_delta(task_id, wait, timeout_ms)
-    }
-
-    pub fn poll_delta_for_session(
-        &mut self,
-        active_session_id: &str,
-        task_id: &str,
-        wait: bool,
-        timeout_ms: u64,
-    ) -> Result<ShellDeltaResult> {
-        self.require_session_owner(task_id, active_session_id)?;
         self.get_output_delta(task_id, wait, timeout_ms)
     }
 
@@ -3546,7 +3570,11 @@ impl ShellManager {
             let owned = active_session_id.is_none_or(|session_id| {
                 !session_id.is_empty() && shell.owner_session_id == session_id
             });
-            if owned && shell.status != ShellStatus::Running && !shell.completion_reported {
+            if owned
+                && shell.owner_agent.is_none()
+                && shell.status != ShellStatus::Running
+                && !shell.completion_reported
+            {
                 shell.completion_reported = true;
                 completions.push(shell.completion_evidence());
                 // The bytes are now in the caller's hands (they become a durable
@@ -3723,7 +3751,7 @@ impl ShellManager {
             .map(|(id, shell)| {
                 (
                     id.clone(),
-                    shell.completion_reported,
+                    shell.completion_reported || shell.owner_agent.is_some(),
                     // Oldest by finish, like the age rule in `cleanup`.
                     shell.finished_at.unwrap_or(shell.started_at),
                     shell.retained_output_bytes(),
@@ -3737,7 +3765,8 @@ impl ShellManager {
         if finished.len() <= MAX_FINISHED_SHELL_RECORDS && total_bytes <= MAX_FINISHED_SHELL_BYTES {
             return;
         }
-        // Undelivered completions last, then oldest first.
+        // Undelivered parent completions last, then oldest first. Child-owned
+        // results never reach the parent model, so they rank with delivered.
         finished.sort_by(|a, b| a.1.cmp(&b.1).reverse().then_with(|| a.2.cmp(&b.2)));
         let mut remaining_count = finished.len();
         let mut remaining_bytes = total_bytes;
@@ -3751,6 +3780,22 @@ impl ShellManager {
             remaining_count -= 1;
             remaining_bytes = remaining_bytes.saturating_sub(bytes);
         }
+    }
+}
+
+fn wait_while_running(shell: &mut BackgroundShell, wait: bool, timeout_ms: u64) {
+    if wait && shell.status == ShellStatus::Running {
+        let timeout = Duration::from_millis(timeout_ms.clamp(1000, 600_000));
+        let deadline = Instant::now() + timeout;
+
+        while shell.status == ShellStatus::Running && Instant::now() < deadline {
+            if shell.poll() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    } else {
+        shell.poll();
     }
 }
 
@@ -3784,9 +3829,9 @@ use crate::tools::spec::{
 };
 use async_trait::async_trait;
 use codewhale_execpolicy::command_safety::{
-    NetworkRead, ReadonlyRejection, SafetyLevel, agent_readonly_verdict, analyze_command,
-    extract_primary_command, is_parallel_readonly_command, normalize_windows_command_paths,
-    readonly_network_reads, split_leading_cd,
+    NetworkRead, ReadonlyRejection, SafetyAnalysis, SafetyLevel, agent_readonly_verdict,
+    analyze_command, extract_primary_command, is_parallel_readonly_command,
+    normalize_windows_command_paths, readonly_network_reads, split_leading_cd,
 };
 use codewhale_execpolicy::toml_rules::{ExecPolicyConfig, RuleDecision};
 use serde_json::json;
@@ -3834,9 +3879,18 @@ fn load_default_policy() -> anyhow::Result<Option<ExecPolicyConfig>> {
     Ok(Some(config))
 }
 
-const FOREGROUND_TIMEOUT_RECOVERY_HINT: &str = "Foreground Bash is for bounded commands. \
-The timed-out process was killed; rerun long work as Bash action=\"run\" background=true, \
-then poll with Bash action=\"wait\" task_id=\"<id>\".";
+/// The last `n` lines of `text`, marking how many were left out.
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= n {
+        return text.to_string();
+    }
+    format!(
+        "[{} earlier lines]\n{}",
+        lines.len() - n,
+        lines[lines.len() - n..].join("\n")
+    )
+}
 
 const MACOS_PROVENANCE_HINT: &str = "Docker buildx failed to update its activity file due to a macOS \
 com.apple.provenance restriction. Files created by Docker Desktop's signed process carry a \
@@ -4035,11 +4089,27 @@ fn looks_like_network_blocked_failure(result: &ShellResult) -> bool {
     .any(|pattern| output.contains(pattern))
 }
 
+const READONLY_OFFLINE_NETWORK_HINT: &str = "This read_only run has no network and cannot write files. Read-only commands reach the network only in Full Access, with a session sandbox that allows network, a [network] policy that does not deny by default, and this agent's network grant. Use a web tool if this session has one; otherwise report the source as unreachable.";
+
+fn readonly_offline_network_hint(command: &str, result: &ShellResult) -> Option<&'static str> {
+    if result.sandbox_denied && crate::sandbox::bwrap_setup_failure(&result.stderr).is_some() {
+        return None;
+    }
+    let rest = split_leading_cd(command).map(|(_, rest)| rest);
+    let command = rest.as_deref().unwrap_or(command);
+    (command_likely_needs_network(command)
+        && (result.sandbox_denied || looks_like_network_blocked_failure(result)))
+    .then_some(READONLY_OFFLINE_NETWORK_HINT)
+}
+
 fn shell_network_restricted_hint<'a>(
     context: &'a ToolContext,
     command: &str,
     result: &ShellResult,
 ) -> Option<&'a str> {
+    if result.sandbox_denied && crate::sandbox::bwrap_setup_failure(&result.stderr).is_some() {
+        return None;
+    }
     let hint = context.shell_network_denied_hint.as_deref()?;
     let policy_blocks_network = context
         .elevated_sandbox_policy
@@ -4062,6 +4132,11 @@ fn shell_network_restricted_hint<'a>(
 fn shell_sandbox_denied_hint(context: &ToolContext, result: &ShellResult) -> Option<String> {
     if !result.sandbox_denied {
         return None;
+    }
+    if let Some(error) = crate::sandbox::bwrap_setup_failure(&result.stderr) {
+        return Some(format!(
+            "The Linux sandbox (bubblewrap) could not be set up, so this command did not run and nothing ran outside the sandbox: {error}. Every sandboxed command fails the same way until the cause it names is fixed or removed, or `prefer_bwrap = false` is set to run without the OS sandbox. [sandbox: Ask-only escalation — to run only this command without the sandbox, retry it once with sandbox_permissions \"danger-full-access\" + justification; the approval prompt asks the user]"
+        ));
     }
     let policy = context.elevated_sandbox_policy.as_ref()?;
     Some(format!(
@@ -4160,7 +4235,7 @@ fn enforce_readonly_network_reads(command: &str, context: &ToolContext) -> Resul
     Ok(())
 }
 
-/// This is a request for mandatory filesystem/network isolation, not a claim
+/// This is a request for mandatory filesystem isolation, not a claim
 /// about what the command does. The executor refuses it without a native
 /// enforcing sandbox and checks the prepared environment again before spawn.
 fn enforced_readonly_input(input: &serde_json::Value) -> bool {
@@ -4228,7 +4303,7 @@ pub(crate) fn sandboxed_runner_command(
             timeout,
             context.elevated_sandbox_policy.clone(),
         );
-    if matches!(exec_env.policy, ExecutionSandboxPolicy::ReadOnly) {
+    if matches!(exec_env.policy, ExecutionSandboxPolicy::ReadOnly { .. }) {
         require_native_readonly_execution(&exec_env)
             .map_err(|error| ToolError::permission_denied(error.to_string()))?;
     }
@@ -4247,7 +4322,7 @@ pub(crate) fn sandboxed_runner_command(
 }
 
 fn require_native_readonly_execution(exec_env: &ExecEnv) -> Result<()> {
-    if matches!(exec_env.policy, ExecutionSandboxPolicy::ReadOnly)
+    if matches!(exec_env.policy, ExecutionSandboxPolicy::ReadOnly { .. })
         && is_native_readonly_sandbox(exec_env.sandbox_type)
     {
         Ok(())
@@ -4343,6 +4418,19 @@ pub(crate) fn readonly_enforced_lane_available(context: &ToolContext) -> bool {
                 .configured_sandbox_type()
                 .is_some_and(is_native_readonly_sandbox)
         })
+}
+
+pub(crate) fn readonly_lane_network_access(context: &ToolContext) -> bool {
+    (context.auto_approve || context.approval_mode == codewhale_execpolicy::ApprovalMode::Bypass)
+        && context
+            .elevated_sandbox_policy
+            .as_ref()
+            .is_some_and(ExecutionSandboxPolicy::has_network_access)
+        && context
+            .network_policy
+            .as_ref()
+            .is_none_or(|decider| !decider.denies_by_default())
+        && crate::tools::web::fetch::network_authorized(context)
 }
 
 /// `exec_shell_input_agent_readonly_verdict` is also the gate-side predicate for the
@@ -4891,12 +4979,11 @@ async fn execute_foreground_via_background(
         None
     };
     let working_dir = receipt_cwd.clone().or(working_dir);
-    let task_id = {
+    let (task_id, detach) = {
         let mut manager = context
             .shell_manager
             .lock()
             .map_err(|_| anyhow!("shell manager lock poisoned"))?;
-        manager.clear_foreground_background_request();
         let owner = shell_job_owner_from_context(context);
         let lifecycle = shell_work_lifecycle_from_context(context);
         let spawned = manager.execute_with_options_env_for_owner_and_work(
@@ -4950,7 +5037,8 @@ async fn execute_foreground_via_background(
                 cwd: process.working_dir.clone(),
             });
         }
-        task_id
+        let detach = manager.register_shell_wait(&context.state_namespace);
+        (task_id, detach)
     };
     let mut foreground = ForegroundShellGuard {
         manager: context.shell_manager.clone(),
@@ -5011,7 +5099,10 @@ async fn execute_foreground_via_background(
                 .shell_manager
                 .lock()
                 .map_err(|_| anyhow!("shell manager lock poisoned"))?;
-            if manager.take_foreground_background_request(&task_id) {
+            if detach.load(Ordering::Acquire) {
+                if let Some(shell) = manager.processes.get_mut(&task_id) {
+                    shell.background = true;
+                }
                 let snapshot = manager.get_output(&task_id, false, 0)?;
                 foreground.armed = false;
                 return Ok(snapshot);
@@ -5042,16 +5133,23 @@ async fn execute_foreground_via_background(
             return Ok(snapshot);
         }
 
+        // The foreground budget is how long the turn waits, never how long
+        // the command may live. Past it the process keeps running as a
+        // background job — exactly as Ctrl+B would move it — and the model
+        // gets the output so far plus the job id to wait on, read, or cancel.
+        // Killing here threw away minutes of a build or test run and made the
+        // model start it over.
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             let mut manager = context
                 .shell_manager
                 .lock()
                 .map_err(|_| anyhow!("shell manager lock poisoned"))?;
-            let mut result = manager.kill(&task_id)?;
-            manager.acknowledge_foreground_completion(&task_id);
-            result.status = ShellStatus::TimedOut;
+            if let Some(process) = manager.processes.get_mut(&task_id) {
+                process.background = true;
+            }
+            let snapshot = manager.get_output(&task_id, false, 0)?;
             foreground.armed = false;
-            return Ok(result);
+            return Ok(snapshot);
         }
 
         tokio::time::sleep(Duration::from_millis(poll_tick_ms)).await;
@@ -5214,7 +5312,7 @@ const FOREGROUND_POLL_MAX_MS: u64 = 100;
 /// no `timeout_ms`. Matches the value the tool's own input schema advertises;
 /// before this existed the omitted case fell through to
 /// `BASH_MAX_TIMEOUT_MS`.
-const CONTRACT_BASH_FOREGROUND_DEFAULT_TIMEOUT_MS: u64 = 120_000;
+const CONTRACT_BASH_FOREGROUND_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 /// Resolve the lifetime for one `bash` run.
 ///
@@ -5222,11 +5320,10 @@ const CONTRACT_BASH_FOREGROUND_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// `BASH_MAX_TIMEOUT_MS` (~24.8 days), so a command that blocked on an
 /// interactive prompt or a hung network call pinned the turn indefinitely —
 /// the tool row just counted seconds while the model waited. The tool's own
-/// schema already promises `action=run 120000`, and its description already
-/// says foreground is for bounded commands, so honor that: an omitted
-/// timeout takes the advertised default, which lets
-/// `FOREGROUND_TIMEOUT_RECOVERY_HINT` kill the process and tell the model to
-/// rerun with `background=true`.
+/// schema already promises `action=run 30000`, so an omitted timeout takes
+/// that default as the foreground wait. Past it the command moves to the
+/// background (it is never killed for running long) and the model gets its
+/// output so far and task id.
 ///
 /// An explicit `timeout_ms` is still honored up to the full contract ceiling,
 /// and background and interactive runs keep their own lifetimes: their
@@ -5244,6 +5341,27 @@ fn contract_bash_timeout_ms(
     requested_ms
 }
 
+fn promotion_notice(
+    context: &ToolContext,
+    task_id: &str,
+    elapsed_seconds: u64,
+    output: &str,
+) -> String {
+    let last_output = context
+        .shell_manager
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .last_output_age_ms(task_id)
+        .map_or_else(
+            || "last output age unknown".to_string(),
+            |ms| format!("last output {}s ago", ms / 1_000),
+        );
+    format!(
+        "Still running after {elapsed_seconds}s ({last_output}; {}); moved to the background as {task_id} (not killed).",
+        output_phase_hint(output)
+    )
+}
+
 fn contract_bash_error_status(result: &ShellResult, timeout_ms: Option<u64>) -> String {
     match result.status {
         ShellStatus::TimedOut => {
@@ -5255,7 +5373,10 @@ fn contract_bash_error_status(result: &ShellResult, timeout_ms: Option<u64>) -> 
             };
             format!("Command timed out after {seconds} seconds")
         }
-        ShellStatus::Killed => "Command aborted".to_string(),
+        ShellStatus::Killed => format!(
+            "Command aborted. {}",
+            kill_outcome_note(&format!("{}{}", result.stdout, result.stderr))
+        ),
         ShellStatus::Failed | ShellStatus::Completed | ShellStatus::Running => format!(
             "Command exited with code {}",
             result.exit_code.unwrap_or(-1)
@@ -5268,10 +5389,23 @@ fn finish_contract_bash_result(
     timeout_ms: Option<u64>,
     context: &ToolContext,
     execution_receipt: Option<serde_json::Value>,
+    readonly_network: bool,
+    network_restricted_hint: Option<&str>,
 ) -> Result<ToolResult, ToolError> {
-    let sandbox_denied_hint = shell_sandbox_denied_hint(context, &result);
+    let sandbox_denied_hint = if network_restricted_hint.is_none() {
+        shell_sandbox_denied_hint(context, &result)
+    } else {
+        None
+    };
     let mut output = result.stdout.clone();
     output.push_str(&result.stderr);
+    if let Some(hint) = network_restricted_hint {
+        output = if output.is_empty() {
+            hint.to_string()
+        } else {
+            format!("{hint}\n\n{output}")
+        };
+    }
     if let Some(hint) = sandbox_denied_hint {
         output = if output.is_empty() {
             hint
@@ -5288,12 +5422,28 @@ fn finish_contract_bash_result(
     if let Some(receipt) = execution_receipt {
         metadata["execution_receipt"] = receipt;
     }
+    if readonly_network {
+        metadata["sandbox_network"] = json!(true);
+    }
+    if let Some(hint) = network_restricted_hint {
+        metadata["sandbox_network_restricted"] = json!(true);
+        metadata["sandbox_network_denied_hint"] = json!(hint);
+    }
     if result.status == ShellStatus::Running {
         let task_id = result.task_id.as_deref().unwrap_or("unknown");
-        let partial = (!output.is_empty()).then(|| format!("\n\nOutput so far:\n{output}"));
+        let so_far = if output.trim().is_empty() {
+            "(no output yet)".to_string()
+        } else {
+            tail_lines(output.trim(), 20)
+        };
+        let notice = promotion_notice(context, task_id, result.duration_ms / 1_000, &output);
+        let completion = if context.owner_agent_id.is_some() {
+            "Its completion stays in task/status and is not injected into the parent model."
+        } else {
+            "Its completion reaches you as a runtime event before your next step; if you end the turn first, a headless run stops it unseen."
+        };
         return Ok(ToolResult::success(format!(
-            "Foreground shell wait moved to /jobs: {task_id}{}\n\nThe command is still running; completion will appear as a runtime event.",
-            partial.as_deref().unwrap_or_default()
+            "{notice}\n\nOutput so far:\n{so_far}\n\n{completion} To see more output or block until it finishes, call `task_shell_wait` directly with task_id=\"{task_id}\"; do not sleep-poll with bash. To stop it, send the same call with cancel=true. It also stops when the session ends."
         )).with_metadata(metadata));
     }
     if result.status != ShellStatus::Completed {
@@ -5338,8 +5488,9 @@ impl ToolSpec for LowercaseBashTool {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": guidance::runtime_command_guidance() },
-                "timeout": { "type": "number", "description": "Optional timeout in seconds; when omitted the command is killed after 120 seconds." },
-                "read_only": { "type": "boolean", "description": "Set true to run analysis code (including Python/SQLite) with mandatory native filesystem read-only isolation and no network. Available during peer writes. Refused when native enforcement is unavailable; no background, stdin, external backend, or sandbox escalation." },
+                "description": { "type": "string", "description": "Optional few-word summary shown to the user beside the command." },
+                "timeout": { "type": "number", "description": "Optional seconds to wait in the foreground (default 30 seconds). A command still running then is not killed: it moves to the background by itself and you get its output so far, how long ago it last printed, its build phase, and a task_id. Call task_shell_wait directly with that task_id to read more or wait for it; do not sleep-poll with bash." },
+                "read_only": { "type": "boolean", "description": "Set true to run analysis code (including Python/SQLite) or a network fetch (curl) with mandatory native filesystem read-only isolation. Outbound network is on only in Full Access when the session sandbox, the network policy and your network grant allow it. Available during peer writes. Refused when native enforcement is unavailable; no background, stdin, external backend, or sandbox escalation." },
                 "sandbox_permissions": {
                     "type": "string",
                     "enum": ["workspace-write", "danger-full-access"],
@@ -5377,6 +5528,15 @@ impl ToolSpec for LowercaseBashTool {
         self.is_read_only_for(input)
     }
 
+    fn refusal_before_approval(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolContext,
+    ) -> Option<ToolResult> {
+        let translated = contract_bash_legacy_input(input).ok()?;
+        BashTool::contract_delegate().refusal_before_approval(&translated, context)
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -5389,6 +5549,30 @@ impl ToolSpec for LowercaseBashTool {
     }
 }
 
+fn dangerous_command_block(safety: &SafetyAnalysis) -> Option<ToolResult> {
+    if safety.level != SafetyLevel::Dangerous {
+        return None;
+    }
+    let reasons = safety.reasons.join("; ");
+    let suggestions = if safety.suggestions.is_empty() {
+        String::new()
+    } else {
+        format!("\nSuggestions: {}", safety.suggestions.join("; "))
+    };
+    Some(ToolResult {
+        content: format!(
+            "BLOCKED: This command was blocked for safety reasons.\n\nReasons: {reasons}{suggestions}\n\nNote: allow_shell=true exposes shell tools, but it does not disable built-in shell safety validation."
+        ),
+        success: false,
+        metadata: Some(json!({
+            "safety_level": "dangerous",
+            "blocked": true,
+            "reasons": safety.reasons,
+            "suggestions": safety.suggestions,
+        })),
+    })
+}
+
 fn contract_bash_legacy_input(input: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
     let object = input
         .as_object()
@@ -5398,7 +5582,12 @@ fn contract_bash_legacy_input(input: &serde_json::Value) -> Result<serde_json::V
         .filter(|key| {
             !matches!(
                 key.as_str(),
-                "command" | "timeout" | "read_only" | "sandbox_permissions" | "justification"
+                "command"
+                    | "description"
+                    | "timeout"
+                    | "read_only"
+                    | "sandbox_permissions"
+                    | "justification"
             )
         })
         .cloned()
@@ -5410,6 +5599,7 @@ fn contract_bash_legacy_input(input: &serde_json::Value) -> Result<serde_json::V
         )));
     }
     let command = required_str(input, "command")?;
+    optional_str(input, "description")?;
     let mut translated = json!({"command": command});
     if let Some(timeout) = input.get("timeout") {
         let seconds = timeout.as_f64().ok_or_else(|| {
@@ -5458,9 +5648,9 @@ pub(crate) fn readonly_bash_input_schema() -> serde_json::Value {
         "properties": {
             "action": { "type": "string", "enum": ["run"] },
             "command": { "type": "string", "description": "A classifier-approved read command, or analysis code with read_only=true" },
-            "read_only": { "type": "boolean", "description": "Require native filesystem read-only and no-network enforcement for analysis code; unavailable sandboxes fail closed." },
+            "read_only": { "type": "boolean", "description": "Require native filesystem read-only enforcement for analysis code or a network fetch (curl); outbound network is on only in Full Access when the session sandbox, the network policy and your network grant allow it. Unavailable sandboxes fail closed." },
             "cwd": { "type": "string", "description": "Workspace-relative working directory" },
-            "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (1000-600000)" }
+            "timeout_ms": { "type": "integer", "description": "Foreground wait in milliseconds (1000-600000). A command still running then moves to the background; it is not killed." }
         },
         "required": ["command"],
         "additionalProperties": false
@@ -5517,7 +5707,7 @@ impl ToolSpec for BashTool {
 
     fn description(&self) -> &'static str {
         if self.read_only {
-            "Inspect with classifier-bounded commands run directly as argv, never through a shell. For analysis code, read_only=true instead requires a native filesystem read-only and no-network sandbox. Only foreground action=run with command, cwd, timeout_ms, and read_only is accepted."
+            "Inspect with classifier-bounded commands run directly as argv, never through a shell. For analysis code or a network fetch (curl), read_only=true instead requires a native filesystem read-only sandbox, with outbound network only in Full Access when the session sandbox, the network policy and your network grant allow it. Only foreground action=run with command, cwd, timeout_ms, and read_only is accepted."
         } else {
             guidance::description()
         }
@@ -5539,10 +5729,10 @@ impl ToolSpec for BashTool {
                     "type": "string",
                     "description": guidance::runtime_command_guidance()
                 },
-                "read_only": { "type": "boolean", "description": "Set true to require native filesystem read-only and no-network execution. Only foreground run with command, cwd and timeout_ms; unavailable enforcement fails closed." },
+                "read_only": { "type": "boolean", "description": "Set true to require native filesystem read-only execution, with outbound network only in Full Access when the session sandbox, the network policy and your network grant allow it. Only foreground run with command, cwd and timeout_ms; unavailable enforcement fails closed." },
                 "timeout_ms": {
                     "type": "integer",
-                    "description": "Timeout in milliseconds. The default depends on the action: action=run 120000 (the standalone Bash tool caps it at 600000), action=wait 30000, action=interact 1000. A foreground action=run that omits this is bounded by that default and killed with a background-rerun hint; pass an explicit value for longer foreground work, or background=true. For action=wait, `timeout_secs` (seconds) and `timeout` (milliseconds) are accepted aliases."
+                    "description": "How long to wait, in milliseconds. action=run: how long the turn waits in the foreground (default 30000, max 600000); a command still running then is NOT killed — it moves to the background by itself and you get its output so far, how long ago it last printed, its build phase, and task_id. action=wait 30000, action=interact 1000. For action=wait, `timeout_secs` (seconds) and `timeout` (milliseconds) are accepted aliases."
                 },
                 "background": {
                     "type": "boolean",
@@ -5676,6 +5866,30 @@ impl ToolSpec for BashTool {
         exec_shell_input_starts_detached(input)
     }
 
+    fn refusal_before_approval(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolContext,
+    ) -> Option<ToolResult> {
+        if context.auto_approve {
+            return None;
+        }
+        let input = if context.shell_policy == ShellPolicy::ReadOnly {
+            normalize_readonly_cd(input)
+        } else {
+            input.clone()
+        };
+        let action = match self.forced_action {
+            Some(forced) => forced,
+            None => optional_str(&input, "action").ok()?.unwrap_or("run"),
+        };
+        if action != "run" {
+            return None;
+        }
+        let command = input.get("command")?.as_str()?;
+        dangerous_command_block(&analyze_command(command))
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -5772,14 +5986,15 @@ impl ToolSpec for BashTool {
                     // A typed denial, so a Fleet worker's no-progress guard
                     // counts it. #6298: an agent has no mode to switch to,
                     // so it gets the same next steps as the other read-only
-                    // gates; only a parent session is pointed at Work mode.
+                    // gates; only a parent session is told the user can
+                    // change modes.
                     let message = if context.owner_agent_id.is_some()
                         || context.tool_authority.is_some()
                     {
                         readonly_refusal(&rejection, readonly_enforced_lane_available(context))
                     } else {
                         format!(
-                            "{rejection}. Use a read-only inspection command, or switch to Work mode (`/mode work`) for write-capable shell work."
+                            "{rejection}. This shell admits read-only inspection commands only. The user can change modes with /mode."
                         )
                     };
                     return Err(ToolError::permission_denied(message));
@@ -5798,7 +6013,14 @@ impl ToolSpec for BashTool {
                 })
                 .transpose()?
         } else {
-            Some(optional_u64(&input, "timeout_ms", 120_000)?.min(600_000))
+            let detached = optional_bool(&input, "background", false)?
+                || optional_bool(&input, "interactive", false)?;
+            let default_ms = if detached {
+                120_000
+            } else {
+                CONTRACT_BASH_FOREGROUND_DEFAULT_TIMEOUT_MS
+            };
+            Some(optional_u64(&input, "timeout_ms", default_ms)?.min(600_000))
         };
         let background = optional_bool(&input, "background", false)?;
         let interactive = optional_bool(&input, "interactive", false)?;
@@ -5894,38 +6116,19 @@ impl ToolSpec for BashTool {
 
         // Safety analysis (always run for metadata, but only block when not in YOLO mode)
         let safety = analyze_command(command);
-        if !context.auto_approve {
-            match safety.level {
-                SafetyLevel::Dangerous => {
-                    let reasons = safety.reasons.join("; ");
-                    let suggestions = if safety.suggestions.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\nSuggestions: {}", safety.suggestions.join("; "))
-                    };
-                    return Ok(ToolResult {
-                        content: format!(
-                            "BLOCKED: This command was blocked for safety reasons.\n\nReasons: {reasons}{suggestions}\n\nNote: allow_shell=true exposes shell tools, but it does not disable built-in shell safety validation."
-                        ),
-                        success: false,
-                        metadata: Some(json!({
-                            "safety_level": "dangerous",
-                            "blocked": true,
-                            "reasons": safety.reasons,
-                            "suggestions": safety.suggestions,
-                        })),
-                    });
-                }
-                SafetyLevel::RequiresApproval | SafetyLevel::Safe | SafetyLevel::WorkspaceSafe => {
-                    // Proceed normally
-                }
-            }
+        if !context.auto_approve
+            && let Some(blocked) = dangerous_command_block(&safety)
+        {
+            return Ok(blocked);
         }
 
         // This explicit mode only narrows the caller's posture. No approval or
         // inherited full-access override can disable the required sandbox.
+        let readonly_network = enforced_readonly && readonly_lane_network_access(context);
         let policy_override = if enforced_readonly {
-            Some(ExecutionSandboxPolicy::ReadOnly)
+            Some(ExecutionSandboxPolicy::ReadOnly {
+                network_access: readonly_network,
+            })
         } else {
             context.elevated_sandbox_policy.clone()
         };
@@ -5970,9 +6173,21 @@ impl ToolSpec for BashTool {
             HashMap::new()
         } else if let Some(hook_executor) = &context.runtime.hook_executor {
             let hook_ctx = crate::hooks::HookContext::new()
+                .with_tool_context(context)
                 .with_tool_name("exec_shell")
                 .with_tool_args(&input);
-            hook_executor.collect_shell_env(&hook_ctx)
+            let executor = Arc::clone(hook_executor);
+            let policy = crate::plugins::activation::extension_host_policy_enabled();
+            #[cfg(test)]
+            let env_scope = crate::test_support::env_scope_ticket();
+            tokio::task::spawn_blocking(move || {
+                let _policy = crate::plugins::activation::PolicyScope::propagate(policy);
+                #[cfg(test)]
+                let _env_scope = crate::test_support::join_env_scope(env_scope);
+                executor.collect_shell_env(&hook_ctx)
+            })
+            .await
+            .unwrap_or_default()
         } else {
             std::collections::HashMap::new()
         };
@@ -6326,12 +6541,19 @@ impl ToolSpec for BashTool {
                         },
                     )
                 });
+                let readonly_offline_hint = (enforced_readonly && !readonly_network)
+                    .then(|| readonly_offline_network_hint(command, &result))
+                    .flatten();
                 if self.optional_timeout {
+                    let network_restricted_hint = readonly_offline_hint
+                        .or_else(|| shell_network_restricted_hint(context, command, &result));
                     return finish_contract_bash_result(
                         result,
                         timeout_ms,
                         context,
                         execution_receipt,
+                        readonly_network,
+                        network_restricted_hint,
                     );
                 }
                 let task_id_str = result.task_id.clone().unwrap_or_default();
@@ -6342,8 +6564,9 @@ impl ToolSpec for BashTool {
                 } else {
                     stdout_summary.clone()
                 };
-                let network_restricted_hint =
-                    shell_network_restricted_hint(context, command, &result).map(str::to_string);
+                let network_restricted_hint = readonly_offline_hint
+                    .or_else(|| shell_network_restricted_hint(context, command, &result))
+                    .map(str::to_string);
                 let sandbox_denied_hint = if network_restricted_hint.is_none() {
                     shell_sandbox_denied_hint(context, &result)
                 } else {
@@ -6372,25 +6595,44 @@ impl ToolSpec for BashTool {
                     let completion_contract = if context.owner_agent_id.is_some() {
                         "completion stays in task/status and is not injected into the parent model."
                     } else {
-                        "completion is delivered to the model as an internal runtime event and shown in task/status state."
+                        "completion is delivered to the model as an internal runtime event before its next step and shown in task/status state; if the turn ends first, a headless run stops the task unseen."
                     };
                     if backgrounded_foreground {
+                        let seconds = result.duration_ms / 1_000;
+                        let so_far = match (result.stdout.trim(), result.stderr.trim()) {
+                            ("", "") => "(no output yet)".to_string(),
+                            (out, "") => tail_lines(out, 20),
+                            ("", err) => format!("STDERR:\n{}", tail_lines(err, 20)),
+                            (out, err) => format!(
+                                "{}\n\nSTDERR:\n{}",
+                                tail_lines(out, 20),
+                                tail_lines(err, 20)
+                            ),
+                        };
+                        let notice = promotion_notice(
+                            context,
+                            &task_id_str,
+                            seconds,
+                            &format!("{}{}", result.stdout, result.stderr),
+                        );
                         format!(
-                            "Foreground shell wait moved to /jobs: {task_id_str}\n\nReturns immediately; {completion_contract} Keep working; call Bash action=\"wait\" task_id=\"{task_id_str}\" at a true dependency to block until completion or timeout."
+                            "{notice}\n\nOutput so far:\n{so_far}\n\n{completion_contract} Keep working if you can. To decide: call `task_shell_wait` directly with task_id=\"{task_id_str}\" for more output or completion, or with cancel=true to stop it. It also stops when the session ends; do not sleep-poll with bash."
                         )
                     } else {
                         format!(
-                            "Background task started: {task_id_str}\n\nReturns immediately; {completion_contract} Codewhale terminates this task when the session exits. If a service must survive a successful headless exec, start it with background=true and persist=true. Keep working; call Bash action=\"wait\" task_id=\"{task_id_str}\" at a true dependency to block until completion or timeout."
+                            "Background task started: {task_id_str}\n\nReturns immediately; {completion_contract} Codewhale terminates this task when the session exits. If a service must survive a successful headless exec, start it with background=true and persist=true. Keep working; call `task_shell_wait` directly with task_id=\"{task_id_str}\" at a true dependency to block until completion or timeout. Do not sleep-poll with bash."
                         )
                     }
                 } else if result.status == ShellStatus::Killed && was_cancelled {
                     format!(
-                        "Command canceled; process killed.\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
-                        result.stdout, result.stderr
+                        "Command canceled; process killed. {}\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
+                        kill_outcome_note(&format!("{}{}", result.stdout, result.stderr)),
+                        result.stdout,
+                        result.stderr
                     )
                 } else if result.status == ShellStatus::TimedOut {
                     format!(
-                        "Command timed out after {timeout_value_ms}ms; process killed.\n\n{FOREGROUND_TIMEOUT_RECOVERY_HINT}\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
+                        "Command timed out after {timeout_value_ms}ms; process killed.\n\nSTDOUT:\n{}\n\nSTDERR:\n{}",
                         result.stdout, result.stderr
                     )
                 } else {
@@ -6483,21 +6725,12 @@ impl ToolSpec for BashTool {
                     };
                     metadata["background_policy"] = json!("nonblocking");
                 }
-                if result.status == ShellStatus::TimedOut && !background && !interactive {
-                    metadata["foreground_timeout_recovery"] = json!({
-                        "process_killed": true,
-                        "hint": FOREGROUND_TIMEOUT_RECOVERY_HINT,
-                        "recommended_tools": ["Bash", "task_shell_start", "task_shell_wait"],
-                        "rerun_as": {"tool": "Bash", "action": "run", "background": true},
-                        "poll_with": [
-                            {"tool": "Bash", "action": "wait"},
-                            {"tool": "task_shell_wait"}
-                        ]
-                    });
-                }
                 if let Some(hint) = network_restricted_hint {
                     metadata["sandbox_network_restricted"] = json!(true);
                     metadata["sandbox_network_denied_hint"] = json!(hint);
+                }
+                if readonly_network {
+                    metadata["sandbox_network"] = json!(true);
                 }
                 if let Some(hint) = sandbox_denied_hint {
                     metadata["sandbox_denied_hint"] = json!(hint);
@@ -6574,7 +6807,7 @@ impl BashTool {
         };
         let timeout_ms = wait_timeout_ms(input)?;
 
-        let (delta, wait_canceled) = if wait {
+        let (delta, interruption) = if wait {
             wait_for_shell_delta_cancellable(context, task_id, timeout_ms).await?
         } else {
             let mut manager = context
@@ -6584,7 +6817,7 @@ impl BashTool {
             let delta = manager
                 .get_output_delta_for_session(&context.state_namespace, task_id, false, timeout_ms)
                 .map_err(|err| ToolError::execution_failed(err.to_string()))?;
-            (delta, false)
+            (delta, None)
         };
 
         let status = delta.result.status.clone();
@@ -6594,17 +6827,30 @@ impl BashTool {
         {
             object.insert("wait_timeout_ms".to_string(), json!(timeout_ms));
         }
-        if wait_canceled {
+        if matches!(status, ShellStatus::Running)
+            && let Some(progress) = context
+                .shell_manager
+                .lock()
+                .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?
+                .running_progress(task_id)
+        {
+            result.content = format!("{progress}\n{}", result.content);
+        }
+        if let Some(interruption) = interruption {
+            let (action, key) = match interruption {
+                ShellWaitInterruption::Canceled => ("canceled", "wait_canceled"),
+                ShellWaitInterruption::Detached => ("detached", "wait_detached"),
+            };
             if matches!(status, ShellStatus::Running) {
                 result.content = format!(
-                    "Wait canceled; background shell task {task_id} is still running.\n\n{}",
+                    "Wait {action}; background shell task {task_id} is still running.\n\n{}",
                     result.content
                 );
             }
             if let Some(metadata) = result.metadata.as_mut()
                 && let Some(object) = metadata.as_object_mut()
             {
-                object.insert("wait_canceled".to_string(), json!(true));
+                object.insert(key.to_string(), json!(true));
             }
         }
 
@@ -6642,6 +6888,7 @@ impl BashTool {
         let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
         let mut timed_out = false;
         let mut wait_canceled = false;
+        let mut wait_detached = false;
 
         let snapshot =
             |manager: &mut ShellManager| -> Result<Vec<(String, ShellStatus)>, ToolError> {
@@ -6649,13 +6896,24 @@ impl BashTool {
                     .iter()
                     .map(|id| {
                         let detail = manager
-                            .inspect_job(id)
+                            .inspect_job_for_session(&context.state_namespace, id)
                             .map_err(|err| ToolError::execution_failed(err.to_string()))?;
                         Ok((id.clone(), detail.snapshot.status))
                     })
                     .collect()
             };
 
+        let detach = if wait {
+            let mut manager = context
+                .shell_manager
+                .lock()
+                .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
+            // Validate every owner before registering or consuming any output.
+            snapshot(&mut manager)?;
+            Some(manager.register_shell_wait(&context.state_namespace))
+        } else {
+            None
+        };
         let mut poll_tick_ms: u64 = FOREGROUND_POLL_INITIAL_MS;
         let statuses = loop {
             let current = {
@@ -6686,6 +6944,13 @@ impl BashTool {
             if !wait || satisfied {
                 break current;
             }
+            if detach
+                .as_ref()
+                .is_some_and(|detach| detach.load(Ordering::Acquire))
+            {
+                wait_detached = true;
+                break current;
+            }
             if std::time::Instant::now() >= deadline {
                 timed_out = true;
                 break current;
@@ -6699,10 +6964,24 @@ impl BashTool {
             .filter(|(_, status)| *status == ShellStatus::Running)
             .count();
         let settled = statuses.len().saturating_sub(running_after);
-        let lines: Vec<String> = statuses
-            .iter()
-            .map(|(id, status)| format!("{id}: {status:?}"))
-            .collect();
+        let lines: Vec<String> = {
+            let mut manager = context
+                .shell_manager
+                .lock()
+                .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
+            statuses
+                .iter()
+                .map(|(id, status)| {
+                    let progress = (*status == ShellStatus::Running)
+                        .then(|| manager.running_progress(id))
+                        .flatten();
+                    match progress {
+                        Some(progress) => format!("{id}: {status:?} ({progress})"),
+                        None => format!("{id}: {status:?}"),
+                    }
+                })
+                .collect()
+        };
         let still_running: Vec<&str> = statuses
             .iter()
             .filter(|(_, status)| *status == ShellStatus::Running)
@@ -6718,9 +6997,14 @@ impl BashTool {
                     still_running.join(", ")
                 }
             )
-        } else if wait_canceled {
+        } else if wait_canceled || wait_detached {
+            let action = if wait_canceled {
+                "canceled"
+            } else {
+                "detached"
+            };
             format!(
-                "wait canceled; still running: {}",
+                "wait {action}; still running: {}",
                 if still_running.is_empty() {
                     "none".to_string()
                 } else {
@@ -6755,6 +7039,9 @@ impl BashTool {
         metadata.insert("timed_out".to_string(), json!(timed_out));
         if wait_canceled {
             metadata.insert("wait_canceled".to_string(), json!(true));
+        }
+        if wait_detached {
+            metadata.insert("wait_detached".to_string(), json!(true));
         }
         Ok(ToolResult {
             content: content.trim().to_string(),
@@ -6861,6 +7148,9 @@ impl BashTool {
             let results = manager
                 .kill_running_for_session(&context.state_namespace)
                 .map_err(|err| ToolError::execution_failed(err.to_string()))?;
+            for result in &results {
+                manager.mark_cancel_reported(result);
+            }
             if results.is_empty() {
                 return Ok(ToolResult {
                     content: "No running background commands.".to_string(),
@@ -6897,12 +7187,20 @@ impl BashTool {
         let result = manager
             .kill_for_session(&context.state_namespace, task_id)
             .map_err(|err| ToolError::execution_failed(err.to_string()))?;
+        manager.mark_cancel_reported(&result);
         let task_id = result
             .task_id
             .clone()
             .unwrap_or_else(|| task_id.to_string());
         Ok(ToolResult {
-            content: format!("Canceled background command: {task_id}"),
+            content: if result.status == ShellStatus::Killed {
+                format!(
+                    "Canceled background command: {task_id}. {}",
+                    kill_outcome_note(&format!("{}{}", result.stdout, result.stderr))
+                )
+            } else {
+                format!("{} Nothing was killed.", wait_timing_line(&result))
+            },
             success: true,
             metadata: Some(json!({
                 "status": format!("{:?}", result.status),
@@ -7094,11 +7392,26 @@ fn wait_timing_line(result: &ShellResult) -> String {
     }
 }
 
+enum ShellWaitInterruption {
+    Canceled,
+    Detached,
+}
+
 async fn wait_for_shell_delta_cancellable(
     context: &ToolContext,
     task_id: &str,
     timeout_ms: u64,
-) -> Result<(ShellDeltaResult, bool), ToolError> {
+) -> Result<(ShellDeltaResult, Option<ShellWaitInterruption>), ToolError> {
+    let detach = {
+        let mut manager = context
+            .shell_manager
+            .lock()
+            .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
+        manager
+            .require_session_owner(task_id, &context.state_namespace)
+            .map_err(|err| ToolError::execution_failed(err.to_string()))?;
+        manager.register_shell_wait(&context.state_namespace)
+    };
     let timeout_ms = timeout_ms.clamp(1000, EXEC_SHELL_WAIT_MAX_TIMEOUT_MS);
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut stdout_accum = String::new();
@@ -7106,11 +7419,11 @@ async fn wait_for_shell_delta_cancellable(
 
     let mut poll_tick_ms: u64 = FOREGROUND_POLL_INITIAL_MS;
     let (command, result, stdout_total_len, stderr_total_len) = loop {
-        if context
+        let canceled = context
             .cancel_token
             .as_ref()
-            .is_some_and(|token| token.is_cancelled())
-        {
+            .is_some_and(|token| token.is_cancelled());
+        if canceled || detach.load(Ordering::Acquire) {
             let mut manager = context
                 .shell_manager
                 .lock()
@@ -7128,7 +7441,11 @@ async fn wait_for_shell_delta_cancellable(
                     delta.stdout_total_len,
                     delta.stderr_total_len,
                 ),
-                true,
+                Some(if canceled {
+                    ShellWaitInterruption::Canceled
+                } else {
+                    ShellWaitInterruption::Detached
+                }),
             ));
         }
 
@@ -7165,7 +7482,7 @@ async fn wait_for_shell_delta_cancellable(
             stdout_total_len,
             stderr_total_len,
         ),
-        false,
+        None,
     ))
 }
 
@@ -7294,22 +7611,36 @@ impl ToolSpec for NoteTool {
         let note_content = required_str(&input, "content")?;
         ensure_notes_target_is_safe(&context.notes_path, &context.workspace).await?;
 
-        // Ensure parent directory exists. Tool handlers run on the Tokio
-        // runtime, so filesystem calls use tokio::fs (blocking-call
-        // convention, #6149).
-        if let Some(parent) = context.notes_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                ToolError::execution_failed(format!("Failed to create notes directory: {e}"))
-            })?;
-        }
-
-        // Append to notes file
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&context.notes_path)
+        let mut file = if context.notes_path.starts_with(&context.workspace) {
+            let workspace = context.workspace.clone();
+            let notes_path = context.notes_path.clone();
+            let file = tokio::task::spawn_blocking(move || {
+                crate::fs_confined::open_append(&workspace, &notes_path)
+            })
             .await
+            .map_err(|e| ToolError::execution_failed(format!("Failed to open notes file: {e}")))?
             .map_err(|e| ToolError::execution_failed(format!("Failed to open notes file: {e}")))?;
+            tokio::fs::File::from_std(file)
+        } else {
+            // Ensure parent directory exists. Tool handlers run on the Tokio
+            // runtime, so filesystem calls use tokio::fs (blocking-call
+            // convention, #6149).
+            if let Some(parent) = context.notes_path.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    ToolError::execution_failed(format!("Failed to create notes directory: {e}"))
+                })?;
+            }
+
+            // Append to notes file
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&context.notes_path)
+                .await
+                .map_err(|e| {
+                    ToolError::execution_failed(format!("Failed to open notes file: {e}"))
+                })?
+        };
 
         use tokio::io::AsyncWriteExt;
         file.write_all(format!("\n---\n{note_content}\n").as_bytes())
@@ -7333,3 +7664,49 @@ impl ToolSpec for NoteTool {
 mod enforced_readonly_tests;
 #[cfg(test)]
 mod tests;
+
+pub(crate) fn foreground_command_requests_detach(command: &str) -> bool {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    let chars = command.chars().collect::<Vec<_>>();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !single_quoted {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !double_quoted {
+            single_quoted = !single_quoted;
+            continue;
+        }
+        if ch == '"' && !single_quoted {
+            double_quoted = !double_quoted;
+            continue;
+        }
+        if ch != '&' || single_quoted || double_quoted {
+            continue;
+        }
+        let previous = index.checked_sub(1).and_then(|i| chars.get(i)).copied();
+        let next = chars.get(index + 1).copied();
+        // `&&`, `&>`/`&>>`, and `>&` are chaining/redirection rather than a
+        // detached child. Any other unquoted ampersand is a background
+        // control operator and is unavailable in ACP.
+        if previous != Some('&') && next != Some('&') && next != Some('>') && previous != Some('>')
+        {
+            return true;
+        }
+    }
+
+    shell_words::split(command).is_ok_and(|words| {
+        words.iter().any(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "nohup" | "disown" | "setsid" | "daemonize"
+            )
+        })
+    })
+}

@@ -11,7 +11,7 @@ import {
   EN_DOCS_SUBAGENTS,
   EN_DOCS_WEB,
   EN_DOCS_WORK,
-  EN_DOCS_COMPUTERS,
+  EN_DOCS_PET,
   EN_DOCS_AUTH,
   EN_DOCS_TRUST,
   EN_DOCS_REVIEW,
@@ -41,7 +41,7 @@ import {
   getDocsSubagents,
   getDocsWeb,
   getDocsWork,
-  getDocsComputers,
+  getDocsPet,
   getDocsAuth,
   getDocsTrust,
   getComputerUse,
@@ -123,7 +123,6 @@ const HOME_PROSE_KEYS = [
   "heroInstallAria",
   "exploreProduct",
   "shotPreview",
-  "shotBuild",
   "screenshotAlt",
   "gainHeading",
   "gainLede",
@@ -137,7 +136,6 @@ const HOME_PROSE_KEYS = [
   "availabilityHeading",
   "availabilityLede",
   "availabilityNote",
-  "accountLink",
   "surfacesHeading",
   "runtimeLink",
   "installBandHeading",
@@ -157,10 +155,14 @@ function flattenStrings(dict: object): Record<string, string> {
     if (typeof value === "string") {
       out[key] = value;
     } else if (Array.isArray(value)) {
-      value.forEach((row: string[], i: number) => {
-        row.forEach((cell, j) => {
-          out[`${key}[${i}][${j}]`] = cell;
-        });
+      value.forEach((row: string | string[], i: number) => {
+        if (typeof row === "string") {
+          out[`${key}[${i}]`] = row;
+        } else {
+          row.forEach((cell, j) => {
+            out[`${key}[${i}][${j}]`] = cell;
+          });
+        }
       });
     }
   }
@@ -272,7 +274,7 @@ describe("website dictionaries", () => {
       ["docs-mcp", getDocsMcp, EN_DOCS_MCP],
       ["docs-web", getDocsWeb, EN_DOCS_WEB],
       ["docs-work", getDocsWork, EN_DOCS_WORK],
-      ["docs-computers", getDocsComputers, EN_DOCS_COMPUTERS],
+      ["docs-pet", getDocsPet, EN_DOCS_PET],
       ["docs-auth", getDocsAuth, EN_DOCS_AUTH],
       ["docs-trust", getDocsTrust, EN_DOCS_TRUST],
       ["docs-review", getDocsReview, EN_DOCS_REVIEW],
@@ -328,7 +330,6 @@ describe("website dictionaries", () => {
       [...text.matchAll(/\]\((\/[^)\s]*)\)/g)].map((m) => m[1]);
     for (const [label, get] of [
       ["docs-auth", getDocsAuth],
-      ["docs-computers", getDocsComputers],
       ["docs-configuration", getDocsConfiguration],
       ["docs-fleet", getDocsFleet],
       ["docs-hooks", getDocsHooks],
@@ -342,6 +343,7 @@ describe("website dictionaries", () => {
       ["docs-trust", getDocsTrust],
       ["docs-web", getDocsWeb],
       ["docs-work", getDocsWork],
+      ["docs-pet", getDocsPet],
     ] as const) {
       const en = get("en");
       const zh = get("zh");
@@ -397,14 +399,23 @@ describe("website dictionaries", () => {
     for (const locale of DICTIONARY_LOCALES) {
       const home = getHome(locale);
       expect(home.gain, `${locale} gain`).toHaveLength(3);
-      expect(home.modelsFacts, `${locale} modelsFacts`).toHaveLength(3);
+      expect(home.modelsFacts, `${locale} modelsFacts`).toHaveLength(4);
       expect(home.availability, `${locale} availability`).toHaveLength(4);
       expect(home.surfaces, `${locale} surfaces`).toHaveLength(5);
       for (const row of [...home.gain, ...home.modelsFacts, ...home.availability, ...home.surfaces]) {
         for (const cell of row) {
+          if (cell === undefined) continue;
           expect(cell.length, `${locale} empty cell`).toBeGreaterThan(0);
         }
       }
+    }
+  });
+
+  it("links the community VS Code GUI to its Marketplace listing in every locale", () => {
+    const marketplace = "https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode";
+    for (const locale of ["en", ...DICTIONARY_LOCALES]) {
+      const row = getHome(locale).availability.find(([surface]) => surface.startsWith("CodeWhale GUI"));
+      expect(row?.[3], `${locale} GUI Marketplace link`).toBe(marketplace);
     }
   });
 

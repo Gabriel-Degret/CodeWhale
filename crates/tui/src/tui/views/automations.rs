@@ -799,7 +799,11 @@ impl ModalView for AutomationsView {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         Clear.render(area, buf);
         Block::default()
-            .style(Style::default().bg(palette::WHALE_BG))
+            .style(
+                Style::default()
+                    .fg(palette::TEXT_PRIMARY)
+                    .bg(palette::WHALE_BG),
+            )
             .render(area, buf);
         if let Some(editor) = &self.editor {
             editor.render(area, buf);
@@ -881,6 +885,7 @@ mod tests {
             updated_at: at,
             next_run_at: Some(at),
             last_run_at: None,
+            revision: 0,
         }
     }
 

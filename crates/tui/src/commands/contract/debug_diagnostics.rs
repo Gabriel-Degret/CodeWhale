@@ -29,7 +29,14 @@ impl CommandDebugDiagnosticsContext for DebugDiagnosticsAdapter<'_> {
     fn balance_projection(&self) -> DebugBalanceProjection {
         let app = self.host.app.borrow();
         DebugBalanceProjection {
-            provider_display_name: app.api_provider.display_name().to_string(),
+            provider_display_name: app
+                .admitted_provider_identity()
+                .map_or("unavailable", |identity| {
+                    identity
+                        .compatibility()
+                        .map_or(identity.key.as_str(), |row| row.label)
+                })
+                .to_string(),
             supports_balance_api: provider_has_balance_api(app.api_provider),
         }
     }
@@ -98,6 +105,11 @@ impl CommandDebugDiagnosticsContext for DebugDiagnosticsAdapter<'_> {
                     reasoning_tokens: rec.reasoning_tokens,
                     reasoning_replay_tokens: rec.reasoning_replay_tokens,
                     server_tool_use: None,
+
+                    input_audio_tokens: None,
+                    output_audio_tokens: None,
+
+                    request_usages: Vec::new(),
                 });
                 DebugCacheTurn {
                     provider: rec.provider.map(|provider| provider.as_str().to_string()),
@@ -240,7 +252,12 @@ pub(crate) fn observe_cache_for_app(
         metadata: None,
         thinking: None,
         reasoning_effort: app
-            .reasoning_effort_api_value_for_replay(target.provider, replay_base_url, &target.model)
+            .reasoning_effort_api_value_for_replay(
+                target.provider,
+                &target.provider_identity,
+                replay_base_url,
+                &target.model,
+            )
             .map(str::to_string),
         stream: Some(true),
         temperature: None,

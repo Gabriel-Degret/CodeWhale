@@ -70,10 +70,34 @@ pub enum ModelsDevFreshness {
     Failed,
 }
 
+/// Where the rows a caller can currently see were produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelsDevProvenance {
+    #[default]
+    Bundled,
+    Live,
+    Cache,
+    File,
+}
+
+impl ModelsDevProvenance {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Bundled => "bundled_snapshot",
+            Self::Live => "models_dev_live",
+            Self::Cache => "models_dev_cache",
+            Self::File => "models_dev_file",
+        }
+    }
+}
+
 /// Quiet status snapshot for UI / `/model refresh` feedback.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ModelsDevStatus {
     pub freshness: ModelsDevFreshness,
+    pub provenance: ModelsDevProvenance,
     pub offering_count: usize,
     pub fetched_at: Option<u64>,
     pub source_label: String,
@@ -82,6 +106,7 @@ pub struct ModelsDevStatus {
 
 static STATUS: RwLock<ModelsDevStatus> = RwLock::new(ModelsDevStatus {
     freshness: ModelsDevFreshness::Bundled,
+    provenance: ModelsDevProvenance::Bundled,
     offering_count: 0,
     fetched_at: None,
     source_label: String::new(),
@@ -175,7 +200,8 @@ pub fn status() -> ModelsDevStatus {
     let current = STATUS.read().map(|guard| guard.clone()).unwrap_or_default();
     honor_bundled_staleness(
         current,
-        codewhale_models::model_catalog::bundled_catalog_is_stale(),
+        codewhale_config::catalog::reviewed::bundled_source_fetched_at()
+            .is_none_or(|fetched_at| !within_ttl(fetched_at, now_unix())),
     )
 }
 
@@ -235,13 +261,15 @@ pub fn maybe_load_persisted_cache() {
     let Some(cache) = load_cache_file(&path) else {
         return;
     };
-    // Live only when the cache is recent by a trustworthy clock *and* came
-    // from the source this process would fetch now. A cache written for
-    // another mirror or override file still publishes (offline startups keep
-    // rows) but as stale, so the next refresh replaces it.
-    let freshness = if within_ttl(cache.fetched_at, now_unix())
-        && cache.source_fingerprint == current_source_fingerprint()
-    {
+    // The cache belongs to the selected source. Another mirror or override
+    // cannot supply fallback facts for this selection.
+    if cache.source_fingerprint != current_source_fingerprint() {
+        mark_failed(ModelsDevRefreshError::InvalidResponse(
+            "cached catalog belongs to a different source".into(),
+        ));
+        return;
+    }
+    let freshness = if within_ttl(cache.fetched_at, now_unix()) {
         ModelsDevFreshness::Live
     } else {
         ModelsDevFreshness::Stale
@@ -251,6 +279,7 @@ pub fn maybe_load_persisted_cache() {
         cache.fetched_at,
         cache.source_label.as_str(),
         freshness,
+        ModelsDevProvenance::Cache,
     ) {
         tracing::debug!(
             target: "models_dev_live",
@@ -262,8 +291,10 @@ pub fn maybe_load_persisted_cache() {
 
 /// Force a refresh: prefer `CODEWHALE_MODELS_DEV_PATH`, else network fetch.
 ///
-/// On success, updates the disk cache and ProviderLake. On failure, keeps any
-/// prior live/bundled rows and records a quiet Failed status.
+/// On success, publishes to ProviderLake and updates the disk cache. On
+/// failure, keeps any prior live/bundled rows and records a quiet Failed
+/// status. A cache write that fails after a successful publish keeps the fresh
+/// rows and reports only the persistence error.
 pub async fn refresh(force_network: bool) -> Result<usize, ModelsDevRefreshError> {
     if let Ok(path) = std::env::var(ENV_MODELS_DEV_PATH) {
         let trimmed = path.trim();
@@ -298,7 +329,13 @@ pub async fn refresh(force_network: bool) -> Result<usize, ModelsDevRefreshError
     };
     let fetched_at = now_unix();
     let fingerprint = base_url_fingerprint(&url);
-    let count = publish_from_body(&body, fetched_at, &url, ModelsDevFreshness::Live)?;
+    let count = publish_from_body(
+        &body,
+        fetched_at,
+        &url,
+        ModelsDevFreshness::Live,
+        ModelsDevProvenance::Live,
+    )?;
     if let Some(path) = cache_path() {
         save_cache_file(
             &path,
@@ -310,7 +347,7 @@ pub async fn refresh(force_network: bool) -> Result<usize, ModelsDevRefreshError
                 body,
             },
         )
-        .inspect_err(|error| mark_failed(error.clone()))?;
+        .inspect_err(note_persistence_error)?;
     }
     Ok(count)
 }
@@ -343,7 +380,10 @@ pub fn spawn_background_refresh() {
     if env_truthy(ENV_DISABLE_FETCH) && std::env::var(ENV_MODELS_DEV_PATH).is_err() {
         return;
     }
-    tokio::spawn(async {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async {
         match refresh(false).await {
             Ok(count) => {
                 tracing::debug!(
@@ -374,7 +414,13 @@ async fn refresh_from_path(path: &Path) -> Result<usize, ModelsDevRefreshError> 
     let fetched_at = now_unix();
     let label = format!("file:{}", path.display());
     let fingerprint = base_url_fingerprint(&label);
-    let count = publish_from_body(&body, fetched_at, &label, ModelsDevFreshness::Live)?;
+    let count = publish_from_body(
+        &body,
+        fetched_at,
+        &label,
+        ModelsDevFreshness::Live,
+        ModelsDevProvenance::File,
+    )?;
     if let Some(cache) = cache_path() {
         save_cache_file(
             &cache,
@@ -386,7 +432,7 @@ async fn refresh_from_path(path: &Path) -> Result<usize, ModelsDevRefreshError> 
                 body,
             },
         )
-        .inspect_err(|error| mark_failed(error.clone()))?;
+        .inspect_err(note_persistence_error)?;
     }
     Ok(count)
 }
@@ -467,6 +513,7 @@ fn publish_from_body(
     fetched_at: u64,
     source_label: &str,
     freshness: ModelsDevFreshness,
+    provenance: ModelsDevProvenance,
 ) -> Result<usize, ModelsDevRefreshError> {
     let catalog = ModelsDevCatalog::parse_json(body).map_err(|err| {
         let mapped = ModelsDevRefreshError::InvalidResponse(err.to_string());
@@ -488,12 +535,19 @@ fn publish_from_body(
     );
     set_status(ModelsDevStatus {
         freshness,
+        provenance,
         offering_count: count,
         fetched_at: Some(fetched_at),
         source_label: source_label.to_string(),
         last_error: None,
     });
     Ok(count)
+}
+
+fn note_persistence_error(err: &ModelsDevRefreshError) {
+    let mut next = status();
+    next.last_error = Some(err.to_string());
+    set_status(next);
 }
 
 fn mark_failed(err: ModelsDevRefreshError) {
@@ -586,7 +640,7 @@ pub(crate) fn offerings_from_json_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ApiProvider;
+    use crate::config::ProviderKind;
     use crate::provider_lake::{
         all_catalog_models_for_provider, clear_live_snapshot, lock_live_snapshot,
     };
@@ -716,12 +770,12 @@ mod tests {
         let count = rt.block_on(refresh(true)).expect("refresh from path");
         assert!(count >= 2);
 
-        let together = all_catalog_models_for_provider(ApiProvider::Together);
+        let together = all_catalog_models_for_provider(ProviderKind::Together);
         assert!(
             together.iter().any(|m| m == "deepseek-ai/DeepSeek-V4-Pro"),
             "Together lake missing live Models.dev row: {together:?}"
         );
-        let moonshot = all_catalog_models_for_provider(ApiProvider::Moonshot);
+        let moonshot = all_catalog_models_for_provider(ProviderKind::Moonshot);
         assert!(
             moonshot.iter().any(|m| m == "kimi-k2.5"),
             "Moonshot lake missing live Models.dev row: {moonshot:?}"
@@ -781,7 +835,7 @@ mod tests {
         let _home = EnvVarGuard::set("CODEWHALE_HOME", dir.path().join("home"));
         let _path = EnvVarGuard::set(ENV_MODELS_DEV_PATH, &path);
 
-        let before = all_catalog_models_for_provider(ApiProvider::Together);
+        let before = all_catalog_models_for_provider(ProviderKind::Together);
         assert!(!before.is_empty(), "bundled Together rows required");
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -791,7 +845,7 @@ mod tests {
         let err = rt.block_on(refresh(true)).expect_err("bad json");
         assert!(matches!(err, ModelsDevRefreshError::InvalidResponse(_)));
 
-        let after = all_catalog_models_for_provider(ApiProvider::Together);
+        let after = all_catalog_models_for_provider(ProviderKind::Together);
         assert_eq!(after, before, "bundled rows must survive parse failure");
         let st = status();
         assert_eq!(st.freshness, ModelsDevFreshness::Failed);
@@ -814,7 +868,7 @@ mod tests {
         let stale = PersistedModelsDevCache {
             schema_version: CACHE_SCHEMA_VERSION,
             fetched_at: 1, // far in the past → stale
-            source_fingerprint: "stale-fp".into(),
+            source_fingerprint: current_source_fingerprint(),
             source_label: "https://models.dev/catalog.json".into(),
             body: FIXTURE.into(),
         };
@@ -824,7 +878,7 @@ mod tests {
         let st = status();
         assert_eq!(st.freshness, ModelsDevFreshness::Stale);
         assert!(st.offering_count >= 2);
-        let together = all_catalog_models_for_provider(ApiProvider::Together);
+        let together = all_catalog_models_for_provider(ProviderKind::Together);
         assert!(together.iter().any(|m| m == "deepseek-ai/DeepSeek-V4-Pro"));
         clear_live_snapshot();
     }
@@ -862,7 +916,7 @@ mod tests {
         };
         save_cache_file(&cache, &foreign).expect("save");
         maybe_load_persisted_cache();
-        assert_eq!(status().freshness, ModelsDevFreshness::Stale);
+        assert_eq!(status().freshness, ModelsDevFreshness::Failed);
 
         // From the current source, but stamped far in the future.
         let future = PersistedModelsDevCache {
@@ -930,7 +984,7 @@ mod tests {
         let err = rt.block_on(refresh(true)).expect_err("dead URL");
         assert!(matches!(err, ModelsDevRefreshError::Network(_)));
 
-        let together = all_catalog_models_for_provider(ApiProvider::Together);
+        let together = all_catalog_models_for_provider(ProviderKind::Together);
         assert!(
             together.iter().any(|m| m == "deepseek-ai/DeepSeek-V4-Pro"),
             "prior live rows must survive network failure"

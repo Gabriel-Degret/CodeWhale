@@ -1,17 +1,16 @@
 //! Typed task-spec loading, artifact refs, deterministic scorers, and receipts.
 
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::{SecondsFormat, Utc};
 use codewhale_protocol::fleet::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+#[cfg(test)]
 use super::ledger::FleetLedger;
 
 const MAX_SCORER_READ_BYTES: u64 = 1_000_000;
@@ -346,10 +345,26 @@ pub fn validate_task_spec_document(doc: &FleetTaskSpecDocument) -> Result<()> {
         }
         validate_tags(&task.id, &task.tags)?;
         validate_workspace_requirements(task)?;
+        super::placement::validate(task)?;
     }
+    ensure!(
+        doc.workers.len() <= 128,
+        "Fleet cannot declare more than 128 workers"
+    );
     let mut worker_ids = BTreeSet::new();
+    let mut environment_hosts = BTreeMap::new();
     for worker in &doc.workers {
         validate_fleet_identity("worker id", &worker.id)?;
+        super::placement::validate_worker(worker)?;
+        if let Some(environment) = &worker.environment
+            && let Some(previous_host) = environment_hosts.insert(&environment.id, &worker.host)
+        {
+            ensure!(
+                previous_host == &worker.host,
+                "Environment {} names more than one execution host",
+                environment.id
+            );
+        }
         if !worker_ids.insert(worker.id.clone()) {
             bail!("duplicate fleet worker id {}", worker.id);
         }
@@ -591,6 +606,7 @@ pub fn prepare_verification_receipt(
     Ok(receipt)
 }
 
+#[cfg(test)]
 pub fn record_verification_receipt(
     ledger: &FleetLedger,
     workspace: &Path,
@@ -917,6 +933,7 @@ mod tests {
                 capabilities: vec!["rust".to_string()],
             }),
             workspace: Some(FleetWorkspaceRequirements {
+                placement: None,
                 root: Some(PathBuf::from(".")),
                 required_files: vec![PathBuf::from("Cargo.toml")],
                 writable_paths: vec![PathBuf::from(".codewhale/fleet")],
@@ -1120,6 +1137,7 @@ mod tests {
 
         security_doc.security_policy = None;
         security_doc.workers.push(FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker 1".to_string(),
             host: FleetHostSpec::Local,

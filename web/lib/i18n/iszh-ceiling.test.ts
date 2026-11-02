@@ -11,7 +11,7 @@ const CEILING = 2;
 
 function walk(dir: string, out: string[] = []): string[] {
   for (const entry of readdirSync(dir)) {
-    if (entry === "node_modules" || entry === ".next" || entry === ".open-next" || entry === ".git") continue;
+    if (entry === "node_modules" || entry === ".next" || entry === ".open-next" || entry === ".git" || entry === ".wrangler" || entry === ".cloudflare") continue;
     const full = join(dir, entry);
     if (statSync(full).isDirectory()) walk(full, out);
     else if (/\.[jt]sx?$/.test(entry)) out.push(full);
@@ -26,7 +26,7 @@ describe("isZh one-way ceiling (#5519)", () => {
       .filter(
         (file) =>
           !file.startsWith(MIGRATION_HOME) &&
-          !/\.test\.[jt]sx?$/.test(file) &&
+          !/\.(test|generated)\.[jt]sx?$/.test(file) &&
           readFileSync(join(ROOT, file), "utf8").includes("isZh"),
       )
       .sort();

@@ -3263,6 +3263,53 @@ fn migrate_config_reports_copied_legacy_path() {
     let _ = fs::remove_dir_all(home);
 }
 
+#[cfg(unix)]
+#[test]
+fn migrate_config_refuses_a_dangling_link_at_the_primary_path() {
+    let _lock = env_lock();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let home = std::env::temp_dir().join(format!(
+        "codewhale-config-migration-link-{}-{unique}",
+        std::process::id()
+    ));
+    let legacy_config = home.join(LEGACY_APP_DIR).join(CONFIG_FILE_NAME);
+    fs::create_dir_all(legacy_config.parent().expect("legacy parent")).expect("legacy dir");
+    fs::write(&legacy_config, b"provider = \"deepseek\"\n").expect("legacy config");
+    let primary = home.join(CODEWHALE_APP_DIR).join(CONFIG_FILE_NAME);
+    fs::create_dir_all(primary.parent().expect("primary parent")).expect("primary dir");
+    let target = home.join("elsewhere").join("created-through-the-link");
+    fs::create_dir_all(target.parent().expect("target parent")).expect("target dir");
+    std::os::unix::fs::symlink(&target, &primary).expect("plant dangling link");
+
+    let _env = StateEnvRestore {
+        home: env::var_os("HOME"),
+        userprofile: env::var_os("USERPROFILE"),
+        codewhale_home: env::var_os("CODEWHALE_HOME"),
+    };
+    // Safety: test-only environment mutation is serialized by env_lock().
+    unsafe {
+        env::set_var("HOME", &home);
+        env::set_var("USERPROFILE", &home);
+        env::remove_var("CODEWHALE_HOME");
+    }
+
+    let error = migrate_config_if_needed().expect_err("a linked primary path is refused");
+    assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+    assert!(!target.exists(), "the link target must not be created");
+    assert!(
+        fs::symlink_metadata(&primary)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the planted link is left as it was"
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
 #[test]
 fn explicit_codewhale_home_bypasses_legacy_config_fallback_and_migration() {
     let _lock = env_lock();
@@ -5646,6 +5693,7 @@ model = "gpt-5.5"
             saved_provider_model: None,
             base_url_override: None,
             limit_overrides: Vec::new(),
+            wire_override: None,
         })
         .expect("documented Zen model must resolve");
     assert_eq!(route.protocol(), crate::route::RequestProtocol::Responses);
@@ -5993,7 +6041,7 @@ mode = "token-plan-usa"
 fn xiaomi_mimo_aliases_resolve_to_canonical_models() {
     assert_eq!(
         normalize_model_for_provider(ProviderKind::XiaomiMimo, "omni"),
-        "mimo-v2.5"
+        "mimo-v2.6-flash"
     );
     assert_eq!(
         normalize_model_for_provider(ProviderKind::XiaomiMimo, "pro-ultraspeed"),
@@ -8430,9 +8478,9 @@ fn workflow_config_defaults_match_product_surface() {
     assert!(defaults.automatic);
     assert!(defaults.auto_start_read_only);
     assert!(defaults.require_approval_for_writes);
-    assert_eq!(defaults.max_children, 1000);
+    assert_eq!(defaults.max_children, 0);
     assert_eq!(defaults.max_concurrent, 16);
-    assert_eq!(defaults.max_depth, 5);
+    assert_eq!(defaults.max_depth, 0);
     // 0 = no shared cap; budgets are opt-in, matching the parent turn loop's
     // advisory policy (#6189).
     assert_eq!(defaults.default_token_budget, 0);
@@ -8475,7 +8523,7 @@ default_token_budget = 50000
     assert!(workflow.auto_start_read_only);
     assert!(workflow.require_approval_for_writes);
     assert_eq!(workflow.max_concurrent, 16);
-    assert_eq!(workflow.max_depth, 5);
+    assert_eq!(workflow.max_depth, 0);
 
     let serialized = toml::to_string_pretty(&workflow).expect("workflow serializes");
     let round_tripped: WorkflowConfigToml =
@@ -8486,14 +8534,12 @@ default_token_budget = 50000
 #[test]
 fn fleet_exec_config_default_matches_subagent_depth() {
     // Fleet workers and standalone sub-agents share one recursion axis:
-    // the fleet default equals DEFAULT_SPAWN_DEPTH (3) and affords >=3
-    // nested delegation levels out of the box.
+    // the fleet default equals DEFAULT_SPAWN_DEPTH without a nesting cap.
     assert_eq!(
         FleetExecConfig::default().max_spawn_depth,
         DEFAULT_SPAWN_DEPTH
     );
-    assert_eq!(FleetExecConfig::default().max_spawn_depth, 3);
-    const { assert!(DEFAULT_SPAWN_DEPTH <= MAX_SPAWN_DEPTH_CEILING) };
+    assert_eq!(FleetExecConfig::default().max_spawn_depth, u32::MAX);
 }
 
 #[test]

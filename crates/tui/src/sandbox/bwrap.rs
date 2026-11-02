@@ -6,9 +6,11 @@
 //!
 //! # How it works
 //!
-//! When `/usr/bin/bwrap` is executable AND the top-level config key
-//! `prefer_bwrap` is set to `true`, exec_shell commands are routed through
-//! bwrap. The bwrap invocation looks like:
+//! When `/usr/bin/bwrap` actually works — it is executable AND it can create
+//! its namespaces on this host — sandboxed exec_shell commands are routed
+//! through it by default. `prefer_bwrap = false` in the config opts out and
+//! leaves Linux commands unwrapped; the posture then reports policy-only.
+//! The bwrap invocation looks like:
 //!
 //! ```text
 //! bwrap \
@@ -43,9 +45,10 @@
 //! - Fedora: `dnf install bubblewrap`
 //! - Arch: `pacman -S bubblewrap`
 //!
-//! If bwrap is not executable, Codewhale reports no Linux OS sandbox and runs
-//! the command without an OS wrapper. It never labels that fallback as
-//! sandboxed.
+//! If bwrap is missing or cannot run (e.g. user namespaces are restricted,
+//! as on Ubuntu 24.04 with `kernel.apparmor_restrict_unprivileged_userns`),
+//! Codewhale reports no Linux OS sandbox and runs the command without an OS
+//! wrapper. It never labels that fallback as sandboxed.
 
 #[cfg(target_os = "linux")]
 use super::policy::WritableRoot;
@@ -66,14 +69,95 @@ pub(crate) fn existing_directory_shim(path: &Path) -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 pub const BWRAP_PATH: &str = "/usr/bin/bwrap";
 
-/// Check if bubblewrap is installed and executable.
+pub(super) fn spawn<T: Send + 'static>(
+    launch: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<T> {
+    use std::sync::{LazyLock, mpsc};
+    type Launch = Box<dyn FnOnce() + Send>;
+    static SPAWNER: LazyLock<std::io::Result<mpsc::Sender<Launch>>> = LazyLock::new(|| {
+        let (sender, receiver) = mpsc::channel::<Launch>();
+        std::thread::Builder::new()
+            .name("codewhale-sandbox-spawner".into())
+            .spawn(move || {
+                for launch in receiver {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(launch));
+                }
+            })?;
+        Ok(sender)
+    });
+    let spawner = SPAWNER
+        .as_ref()
+        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    spawner
+        .send(Box::new(move || {
+            let _ = sender.send(launch());
+        }))
+        .map_err(|_| std::io::Error::other("sandbox spawner stopped"))?;
+    receiver
+        .recv()
+        .map_err(|_| std::io::Error::other("sandbox spawn did not return"))
+}
+
+/// How long the availability probe may take. A working bwrap runs a wrapped
+/// `/bin/true` in well under a second, even on a loaded host.
+#[cfg(target_os = "linux")]
+const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether bwrap is executable AND can actually confine a child here.
+///
+/// The exec bit alone lies on hosts where user namespaces are restricted:
+/// bwrap starts but cannot create the sandbox, so every wrapped command
+/// would fail instead of running unsandboxed. The check therefore runs a
+/// real wrapped `/bin/true` once, built by [`build_bwrap_command`] itself so
+/// the probe covers the same argument shape the real path uses, and caches
+/// the verdict for the process.
 #[cfg(target_os = "linux")]
 pub fn is_available() -> bool {
-    is_executable(std::path::Path::new(BWRAP_PATH))
+    fn probe() -> bool {
+        use wait_timeout::ChildExt as _;
+        if !is_executable(std::path::Path::new(BWRAP_PATH)) {
+            return false;
+        }
+        let command = build_bwrap_command(
+            std::path::Path::new("/"),
+            "/bin/true",
+            &[],
+            &[],
+            false,
+            &crate::sandbox::BwrapMountExtensions::default(),
+            &[],
+            &[],
+        );
+        let Some((program, args)) = command.split_first() else {
+            return false;
+        };
+        let mut child = match std::process::Command::new(program)
+            .args(args)
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return false,
+        };
+        match child.wait_timeout(PROBE_DEADLINE) {
+            Ok(Some(status)) => status.success(),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                false
+            }
+        }
+    }
+    static VERDICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERDICT.get_or_init(probe)
 }
 
 #[cfg(target_os = "linux")]
-fn is_executable(path: &std::path::Path) -> bool {
+pub(crate) fn is_executable(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::metadata(path)
@@ -260,9 +344,7 @@ fn existing_directory(path: &Path) -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 pub fn detect_denial(exit_code: i32, stderr: &str) -> bool {
     exit_code != 0
-        && (stderr
-            .lines()
-            .any(|line| line.trim_start().starts_with("bwrap:"))
+        && (super::bwrap_setup_failure(stderr).is_some()
             || stderr.contains("Read-only file system"))
 }
 

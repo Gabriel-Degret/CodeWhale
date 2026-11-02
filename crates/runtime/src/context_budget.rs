@@ -25,9 +25,14 @@
 //! A route can publish a total context window, an output ceiling, and a
 //! separate input ceiling. [`ContextBudget::new_with_input_limit`] intersects
 //! all three without treating one as a substitute for another: the output
-//! reservation is the exact route-effective wire request, the total-window
+//! reservation is the route-effective wire request (a quarter of the window, at
+//! most 64K and never more than that request, on a route that shares one window
+//! between input and output), the total-window
 //! arithmetic remains saturating, and a concrete input limit clamps the final
 //! spendable ceiling and compaction trigger.
+
+pub const CONTEXT_WARNING_THRESHOLD_PERCENT: f64 = 85.0;
+pub const CONTEXT_CRITICAL_THRESHOLD_PERCENT: f64 = 95.0;
 
 // This module IS wired. `ContextBudget` is consumed by `route_budget.rs` and
 // `core/engine/context.rs`; `PressureLevel` by `context_report.rs`. It sits on

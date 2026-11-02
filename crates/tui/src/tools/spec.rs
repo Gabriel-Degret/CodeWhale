@@ -584,8 +584,15 @@ pub struct ToolContext {
 /// useful, without growing the top-level context by another field per feature.
 #[derive(Clone)]
 pub struct ToolExecutionState {
+    /// Actual Core caller admission for per-round Python RPCs. Kernels do not
+    /// retain it; unattached tool contexts cannot make model calls.
+    pub(crate) rlm_caller: Option<Arc<crate::core::engine::rlm_host::CapturedRlmCaller>>,
     /// Effective session/ancestor tool ceiling, carried to MCP dispatch and runtime registration.
     pub(crate) disallowed_tools: Vec<String>,
+    /// Trusted local host narrowing; inherited by every alias/nested context.
+    pub(crate) acp_host: Option<codewhale_config::AppMode>,
+    /// Captured child grant; retained through aliases and context overrides.
+    pub(crate) child_host: Option<Arc<crate::tools::subagent::engine::ChildAuthority>>,
     /// Set only on the context of one call a person approved on a card.
     pub(crate) human_decision: Option<crate::core::engine::HumanDecision>,
     /// Shared shell manager for background tasks and streaming IO.
@@ -728,6 +735,7 @@ pub struct ToolExecutionState {
     /// Where the session's live permission posture lives. Set by the engine;
     /// every agent call re-reads it (`None` keeps the posture above as is).
     pub(crate) live_posture: Option<crate::core::engine::LivePosture>,
+    pub(crate) browser_tool: Option<String>,
 }
 
 impl std::ops::Deref for ToolContext {
@@ -788,7 +796,10 @@ impl ToolContext {
         Self {
             workspace,
             execution: Box::new(ToolExecutionState {
+                rlm_caller: None,
                 disallowed_tools: Vec::new(),
+                acp_host: None,
+                child_host: None,
                 human_decision: None,
                 shell_manager,
                 file_read_tracker: new_shared_file_read_tracker(),
@@ -831,6 +842,7 @@ impl ToolContext {
                 route_capabilities: codewhale_config::route::RouteCapabilities::default(),
                 nested_call_gate: None,
                 live_posture: None,
+                browser_tool: None,
             }),
         }
     }
@@ -872,19 +884,11 @@ impl ToolContext {
         &mut self,
     ) -> Option<crate::core::engine::LiveRuntimeAuthority> {
         let live = self.live_posture.clone()?;
-        Some(live.apply(self))
-    }
-
-    /// Resolves once the live posture differs from what it is now; never for
-    /// a context without a live source.
-    pub(crate) async fn live_posture_moved(&self) {
-        let Some(live) = self.live_posture.as_ref() else {
-            return std::future::pending().await;
-        };
-        let start = live.read();
-        while live.read() == start {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let authority = live.apply(self);
+        if let Some(child) = self.child_host.as_ref() {
+            self.shell_policy = self.shell_policy.min_with(child.grant.shell_policy());
         }
+        Some(authority)
     }
 
     /// Stamp tool work with the sub-agent that owns it.
@@ -981,10 +985,13 @@ impl ToolContext {
     }
 
     fn authority_clamped_shell_policy(&self, policy: ShellPolicy) -> ShellPolicy {
-        match self.tool_authority.as_deref() {
+        let policy = match self.tool_authority.as_deref() {
             Some(cap) => policy.min_with(cap.shell.shell_policy()),
             None => policy,
-        }
+        };
+        self.child_host
+            .as_ref()
+            .map_or(policy, |child| policy.min_with(child.grant.shell_policy()))
     }
 
     /// Attach an external sandbox backend for remote shell execution.
@@ -1044,6 +1051,31 @@ impl ToolContext {
         path: &Path,
         requested_path: &str,
     ) -> Result<(), ToolError> {
+        self.require_fresh_read_for(
+            path,
+            requested_path,
+            "File action=\"edit\"",
+            "File with action=\"read\"",
+            "File action=\"read\"",
+        )
+    }
+
+    pub fn require_fresh_read_before_write(
+        &self,
+        path: &Path,
+        requested_path: &str,
+    ) -> Result<(), ToolError> {
+        self.require_fresh_read_for(path, requested_path, "write", "read", "read")
+    }
+
+    fn require_fresh_read_for(
+        &self,
+        path: &Path,
+        requested_path: &str,
+        mutation: &str,
+        read_call: &str,
+        read: &str,
+    ) -> Result<(), ToolError> {
         let prior = {
             let tracker = self.file_read_tracker.lock().map_err(|_| {
                 ToolError::execution_failed(
@@ -1055,25 +1087,25 @@ impl ToolContext {
 
         let Some(prior) = prior else {
             return Err(ToolError::execution_failed(format!(
-                "Refusing File action=\"edit\" for {} because it has not been read in this session. \
-                 Recovery: call File with action=\"read\" path=\"{requested_path}\" to inspect the current contents, \
-                 then retry File action=\"edit\" with a unique search string.",
+                "Refusing {mutation} for {} because it has not been read in this session. \
+                 Recovery: call {read_call} path=\"{requested_path}\" to inspect the current contents, \
+                 then retry {mutation}.",
                 path.display()
             )));
         };
 
         let current = file_read_snapshot(path).map_err(|e| {
             ToolError::execution_failed(format!(
-                "Refusing File action=\"edit\" for {} because the file could not be checked for staleness ({e}). \
-                 Recovery: call File with action=\"read\" path=\"{requested_path}\" again, then retry File action=\"edit\".",
+                "Refusing {mutation} for {} because the file could not be checked for staleness ({e}). \
+                 Recovery: call {read_call} path=\"{requested_path}\" again, then retry {mutation}.",
                 path.display()
             ))
         })?;
 
         if current != prior {
             return Err(ToolError::execution_failed(format!(
-                "Refusing File action=\"edit\" for {} because it changed since the last File action=\"read\" call. \
-                 Recovery: call File with action=\"read\" path=\"{requested_path}\" again and retry with the current contents.",
+                "Refusing {mutation} for {} because it changed since the last {read} call. \
+                 Recovery: call {read_call} path=\"{requested_path}\" again and retry with the current contents.",
                 path.display()
             )));
         }
@@ -1584,6 +1616,14 @@ pub trait ToolSpec: Send + Sync {
         false
     }
 
+    fn refusal_before_approval(
+        &self,
+        _input: &Value,
+        _context: &ToolContext,
+    ) -> Option<ToolResult> {
+        None
+    }
+
     /// Resolve input-specific policy without performing external side effects.
     ///
     /// Resource claims deliberately default to global exclusivity until a
@@ -1610,6 +1650,16 @@ pub trait ToolSpec: Send + Sync {
     /// grant covers one reviewed plugin build: an updated plugin, or another
     /// plugin that later registers the same name, is asked again.
     fn approval_scope(&self) -> Option<String> {
+        None
+    }
+
+    /// Who this tool is, if it is an extension tool: composed by Rust from its
+    /// registration. `Some` makes the turn loop serve a permission gate for
+    /// the tool's call, through which its `core/call`s are planned and
+    /// approved like a model's, and makes the tool unreachable from any other
+    /// extension's `core/call` (no recursion). `None` (every built-in, script
+    /// and MCP tool) changes nothing.
+    fn extension_caller(&self) -> Option<crate::tools::codemode::ExtensionCaller> {
         None
     }
 

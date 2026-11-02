@@ -75,6 +75,19 @@ pub struct CompactionConfig {
 pub trait CompactionNoticeSink: Send + Sync + std::fmt::Debug {
     /// Deliver one already-rendered, user-visible sentence.
     fn notice(&self, message: String);
+    /// Captured dispatch origin for a child; ordinary engines retain the existing billing path.
+    fn accounting_origin(&self) -> Option<(crate::cost_status::CostScopeToken, String, String)> {
+        None
+    }
+    /// Projection after the existing billing block has settled this exact response once.
+    fn settled_usage<'a>(
+        &'a self,
+        _source: &'a str,
+        _route: &'a crate::cost_status::EffectiveRouteEnvelope,
+        _usage: &'a Usage,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
 }
 
 /// Host-prepared configuration carried from compaction eligibility through
@@ -92,6 +105,7 @@ pub struct PreparedCompactionEnvelope {
     /// request that omits it shares no cacheable prefix with the turn it
     /// summarizes and re-bills the whole history uncached.
     pub reasoning_effort: Option<String>,
+    pub image_cap: Option<usize>,
     /// User-visible progress sink supplied by the host that owns the run
     /// (the interactive engine, typically). `None` keeps every notice in the
     /// log only — the pass itself never depends on it.
@@ -105,6 +119,7 @@ impl std::fmt::Debug for PreparedCompactionEnvelope {
             .field("session_id", &self.session_id)
             .field("tools", &self.tools)
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("image_cap", &self.image_cap)
             .field("notice_sink", &self.notice_sink.as_ref().map(|_| "<sink>"))
             .finish()
     }
@@ -118,6 +133,7 @@ impl PartialEq for PreparedCompactionEnvelope {
             && self.session_id == other.session_id
             && self.tools == other.tools
             && self.reasoning_effort == other.reasoning_effort
+            && self.image_cap == other.image_cap
     }
 }
 
@@ -129,6 +145,7 @@ impl PreparedCompactionEnvelope {
             session_id: None,
             tools: None,
             reasoning_effort: None,
+            image_cap: None,
             notice_sink: None,
         }
     }
@@ -495,6 +512,36 @@ pub(crate) fn is_compaction_checkpoint_message(message: &Message) -> bool {
         || user_text_of(message).is_some_and(|text| is_legacy_compaction_summary_text(&text))
 }
 
+/// Whether this history already carries a provenance-stamped checkpoint.
+///
+/// A stamped carrier postdates stamping, so within that history only the
+/// stamped form is a checkpoint: a user turn whose text merely starts with a
+/// legacy summary header (a pasted transcript, for example) is content. A
+/// history without one (a legacy session, or any session not yet compacted)
+/// keeps the loose form, so a pasted legacy header still reads as a
+/// checkpoint at a session's first compaction. The signal is the history's content, not the session's age: it
+/// is one-way and destructible (`/edit` or a host rewind can truncate away
+/// the only stamped carrier), and typed input cannot forge the two-block
+/// form.
+#[must_use]
+pub(crate) fn history_is_post_provenance(messages: &[Message]) -> bool {
+    messages.iter().any(is_wire_compaction_checkpoint_message)
+}
+
+/// Era-aware checkpoint recognition for the recompaction family: the loose
+/// legacy fallback applies only in a history with no stamped carrier.
+#[must_use]
+pub(crate) fn is_compaction_checkpoint_message_in_era(
+    message: &Message,
+    post_provenance: bool,
+) -> bool {
+    if post_provenance {
+        is_wire_compaction_checkpoint_message(message)
+    } else {
+        is_compaction_checkpoint_message(message)
+    }
+}
+
 /// Request-time recognition: exactly the header text block plus the
 /// provenance block. User text merely quoting a marker keeps its original
 /// wire position. Checkpoints saved before the handoff note still pass, so
@@ -559,9 +606,9 @@ pub(crate) fn estimate_tokens_for_message(message: &Message, include_thinking: b
             // assistant messages and across later user turns.
             ContentBlock::Thinking { thinking, .. } if include_thinking => thinking.len() / 4,
             ContentBlock::Thinking { .. } => 0,
-            ContentBlock::ToolUse { input, .. } => serde_json::to_string(input)
-                .map(|s| s.len() / 4)
-                .unwrap_or(100),
+            ContentBlock::ToolUse { input, .. } => {
+                compact_json_len(input).map_or(100, |len| len / 4)
+            }
             ContentBlock::ToolResult {
                 content,
                 content_blocks,
@@ -583,13 +630,21 @@ pub(crate) fn estimate_tokens_for_message(message: &Message, include_thinking: b
             // tiles are typically ~1k tokens); erring high compacts slightly
             // early rather than overflowing.
             ContentBlock::ImageUrl { .. } => IMAGE_TOKEN_ESTIMATE,
-            ContentBlock::ServerToolUse { input, .. } => input.to_string().len() / 4,
+            ContentBlock::ServerToolUse { input, .. } => {
+                compact_json_len(input).unwrap_or_default() / 4
+            }
             ContentBlock::ToolSearchToolResult { content, .. }
             | ContentBlock::CodeExecutionToolResult { content, .. } => {
-                content.to_string().len() / 4
+                compact_json_len(content).unwrap_or_default() / 4
             }
         })
         .sum::<usize>()
+}
+
+fn compact_json_len(value: &serde_json::Value) -> Option<usize> {
+    let mut counter = crate::utils::CountingWriter::new();
+    serde_json::to_writer(&mut counter, value).ok()?;
+    Some(counter.count())
 }
 
 /// Conservative flat token estimate for an inline image (`ContentBlock::ImageUrl`).
@@ -677,6 +732,17 @@ pub fn estimate_input_tokens_for_pressure(
         .saturating_add(framing_overhead)
 }
 
+#[must_use]
+pub(crate) fn estimate_request_input_tokens(
+    messages: &[Message],
+    system: Option<&SystemPrompt>,
+    tools: Option<&[Tool]>,
+) -> usize {
+    estimate_input_tokens_for_pressure(messages, system).saturating_add(tools.map_or(0, |tools| {
+        serde_json::to_string(tools).map_or(0, |schema| schema.len().div_ceil(4))
+    }))
+}
+
 fn estimate_retained_floor_conservative(
     messages: &[Message],
     system_prompt: Option<&SystemPrompt>,
@@ -740,8 +806,7 @@ pub fn compaction_pressure_reached_with_billed(
     // Billing alone proving pressure short-circuits the walk (#perf-r5):
     // `estimated.max(billed) >= threshold` is unconditionally true when
     // `billed >= threshold`, so estimating cannot change the answer and the
-    // O(transcript) pass is skipped. Over-pressure sessions pay this check
-    // multiple times per step (pressure gate + decision re-check).
+    // O(transcript) pass is skipped.
     if billed >= config.token_threshold {
         return true;
     }
@@ -1427,6 +1492,7 @@ pub async fn compact_messages_safe(
             system_prompt,
             prepared.tools.as_deref(),
             prepared.reasoning_effort.as_deref(),
+            prepared.image_cap,
             prepared.notice_sink.as_deref(),
             &mut quality_retries,
             invocation_usage,
@@ -1515,7 +1581,23 @@ fn is_orphaned_result_block(block: &ContentBlock) -> bool {
     )
 }
 
+/// Test convenience: derive the era from the slice itself. Production
+/// callers pass [`retained_user_messages_in_era`] the era of the history the
+/// slice belongs to — retention runs on the pre-round prefix, whose carrier
+/// may sit inside the round.
+#[cfg(test)]
 pub(crate) fn retained_user_messages(messages: &[Message], max_tokens: usize) -> Vec<Message> {
+    retained_user_messages_in_era(history_is_post_provenance(messages), messages, max_tokens)
+}
+
+/// `post_provenance` must be derived from the history the slice belongs to,
+/// not from the slice itself: retention runs on the pre-round prefix, whose
+/// carrier may sit inside the round.
+pub(crate) fn retained_user_messages_in_era(
+    post_provenance: bool,
+    messages: &[Message],
+    max_tokens: usize,
+) -> Vec<Message> {
     let mut selected: Vec<Message> = Vec::new();
     let mut remaining = max_tokens;
     for msg in messages.iter().rev() {
@@ -1532,7 +1614,7 @@ pub(crate) fn retained_user_messages(messages: &[Message], max_tokens: usize) ->
         {
             continue;
         }
-        if is_compaction_checkpoint_message(msg) {
+        if is_compaction_checkpoint_message_in_era(msg, post_provenance) {
             continue;
         }
         let tokens: usize = msg
@@ -1593,6 +1675,7 @@ async fn compact_messages(
         None,
         None,
         None,
+        None,
         &mut quality_retries,
         &mut invocation_usage,
     )
@@ -1607,6 +1690,7 @@ async fn compact_messages_with_metadata(
     system_prompt: Option<&SystemPrompt>,
     tools: Option<&[Tool]>,
     reasoning_effort: Option<&str>,
+    image_cap: Option<usize>,
     notice_sink: Option<&dyn CompactionNoticeSink>,
     quality_retries: &mut u32,
     invocation_usage: &mut Usage,
@@ -1622,6 +1706,7 @@ async fn compact_messages_with_metadata(
         system_prompt,
         tools,
         reasoning_effort,
+        image_cap,
         notice_sink,
         quality_retries,
         invocation_usage,
@@ -1814,9 +1899,9 @@ fn drop_oldest_history_messages(messages: &mut Vec<Message>) -> bool {
 /// Known limit: `tool_choice: "none"` keeps the summary from executing tools.
 /// Anthropic Messages documents a `tool_choice` change as invalidating the
 /// cached *message* blocks (system and tools stay cached), so on those routes
-/// the history is still re-read uncached. The Responses (Codex) builder does
-/// not send this field; its cache effect on Chat Completions routes has not
-/// been measured live.
+/// the history is still re-read uncached. The Responses builder forwards
+/// `none` (and sends `auto` for every other choice); its cache effect on
+/// Responses and Chat Completions routes has not been measured live.
 pub(crate) fn compaction_summary_request(
     history: Vec<Message>,
     config: &CompactionConfig,
@@ -1857,6 +1942,7 @@ async fn create_summary(
     system_prompt: Option<&SystemPrompt>,
     tools: Option<&[Tool]>,
     reasoning_effort: Option<&str>,
+    image_cap: Option<usize>,
     notice_sink: Option<&dyn CompactionNoticeSink>,
     quality_retries: &mut u32,
     invocation_usage: &mut Usage,
@@ -1874,6 +1960,20 @@ async fn create_summary(
         logging::warn(format!(
             "Compaction omitted {stripped_images} image block(s) unsupported by its route"
         ));
+    }
+    if let Some(cap) = image_cap {
+        let window = crate::image_attach::cap_request_images(&mut request_messages, cap);
+        if window.elided > 0 {
+            let message = format!(
+                "Making room: the summary request sends the newest {} of {} images; {} older go as text notes (limit {} per request).",
+                window.total - window.elided,
+                window.total,
+                window.elided,
+                window.cap,
+            );
+            logging::warn(&message);
+            deliver_compaction_notice(notice_sink, message);
+        }
     }
     request_messages.push(Message {
         role: Role::User,
@@ -1899,18 +1999,55 @@ async fn create_summary(
         // much output the model may need instead of imposing a smaller,
         // compaction-only ceiling that can be consumed by hidden reasoning.
         let cost_route = client.effective_route_envelope(&config.model, chrono::Utc::now());
+        let ceiling = client.effective_max_output_tokens(&cost_route.model);
+        let summary_floor = crate::route_budget::route_output_reservation(
+            cost_route.provider,
+            &cost_route.model,
+            client.route_limits(),
+        )
+        .min(ceiling)
+            / 2;
+        let max_tokens = match crate::route_budget::request_output_cap_for_input(
+            cost_route.provider,
+            &cost_route.model,
+            client.route_limits(),
+            ceiling,
+            u64::try_from(estimate_request_input_tokens(
+                &request_messages,
+                system_prompt,
+                tools,
+            ))
+            .unwrap_or(u64::MAX),
+        ) {
+            Some(cap) if cap >= summary_floor => cap,
+            _ => {
+                if !drop_oldest_history_messages(&mut request_messages) {
+                    anyhow::bail!(
+                        "The summary request for making room leaves too little output room in this route's context window, and no older history is left to drop."
+                    );
+                }
+                logging::warn(
+                    "Compaction summary input leaves too little output room in the context \
+                     window; dropped the oldest history item and retrying",
+                );
+                continue;
+            }
+        };
         let request = compaction_summary_request(
             request_messages.clone(),
             config,
             system_prompt,
             tools,
             reasoning_effort,
-            client.effective_max_output_tokens(&cost_route.model),
+            max_tokens,
         );
 
         // Capture the session scope before awaiting so a late response cannot
         // accrue into a subsequently loaded/new session.
-        let cost_scope = crate::cost_status::scope_token();
+        let accounting_origin = notice_sink.and_then(CompactionNoticeSink::accounting_origin);
+        let cost_scope = accounting_origin
+            .as_ref()
+            .map_or_else(crate::cost_status::scope_token, |origin| origin.0);
         let response = match client.create_message(request).await {
             Ok(response) => response,
             // A byte-side size rejection can also read like a length problem
@@ -2006,22 +2143,63 @@ async fn create_summary(
         // A rejected summary or canceled retry still consumed these tokens.
         crate::core::turn::add_usage_to(invocation_usage, &response.usage);
 
-        // Compaction summary calls are billed; route the tokens through the
-        // side-channel so the dashboard total matches the website (#526).
-        crate::cost_status::report_effective_route_for_runtime(
-            cost_scope,
-            config.runtime_cost_owner.as_deref(),
-            &format!(
-                "compaction:dispatch:{}:response:{}",
-                cost_route
-                    .dispatched_at
-                    .timestamp_nanos_opt()
-                    .unwrap_or_default(),
-                response.id
-            ),
-            &cost_route,
-            &response.usage,
+        let source_id = format!(
+            "compaction:dispatch:{}:response:{}",
+            cost_route
+                .dispatched_at
+                .timestamp_nanos_opt()
+                .unwrap_or_default(),
+            response.id
         );
+        if let Some((scope, session, agent)) = accounting_origin.as_ref() {
+            if crate::core::engine::turn_loop::usage_has_reported_data(&response.usage) {
+                if let Some(owner) = config.runtime_cost_owner.as_deref() {
+                    crate::cost_status::report_effective_route_for_runtime(
+                        *scope,
+                        Some(owner),
+                        &source_id,
+                        &cost_route,
+                        &response.usage,
+                    );
+                } else {
+                    crate::cost_status::report_effective_route_for_interactive_origin(
+                        *scope,
+                        session,
+                        agent,
+                        &source_id,
+                        &cost_route,
+                        &response.usage,
+                    );
+                }
+            } else if let Some(owner) = config.runtime_cost_owner.as_deref() {
+                crate::cost_status::report_unreceipted_provider_success(
+                    *scope,
+                    Some(owner),
+                    &source_id,
+                    &cost_route,
+                );
+            } else {
+                crate::cost_status::report_unreceipted_for_interactive_origin(
+                    *scope,
+                    session,
+                    agent,
+                    &source_id,
+                    &cost_route,
+                );
+            }
+        } else {
+            crate::cost_status::report_effective_route_for_runtime(
+                cost_scope,
+                config.runtime_cost_owner.as_deref(),
+                &source_id,
+                &cost_route,
+                &response.usage,
+            );
+        }
+        if let Some(sink) = notice_sink {
+            sink.settled_usage(&source_id, &cost_route, &response.usage)
+                .await;
+        }
 
         // Usage above is already billed; a provider-declared incomplete
         // summary must still fail rather than replace the session history
@@ -2161,12 +2339,13 @@ fn is_context_window_error(e: &anyhow::Error) -> bool {
         return false;
     }
 
+    // Only genuine overflow wording drops history. The category alone is far
+    // too wide: it now covers every rejected request (#6843), so a bare
+    // `token` or `maximum` ("max_tokens must be <= 8192", "temperature exceeds
+    // maximum 2") must not peel the summary input away on each retry.
     let lower = text.to_lowercase();
-    lower.contains("context")
-        || lower.contains("token")
-        || lower.contains("prompt is too long")
-        || lower.contains("requested")
-        || lower.contains("maximum")
+    is_context_window_error_message(&text)
+        || (lower.contains("requested") && lower.contains("tokens") && lower.contains("maximum"))
 }
 
 /// Collect text from a user message without treating tool-result payloads
@@ -2284,6 +2463,60 @@ mod tests {
             restore_compaction_checkpoint(vec![legacy.clone(), legacy], Some(&summary));
         assert_eq!(legacy_restored.len(), 1);
         assert!(is_wire_compaction_checkpoint_message(&legacy_restored[0]));
+    }
+
+    #[test]
+    fn restore_anchors_at_the_real_carrier_when_a_pasted_summary_precedes_it() {
+        // Mirror order of the duplicate-carrier test above: the pasted full
+        // summary comes BEFORE the real provenance carrier — the order in
+        // which a content-based anchor would land on the pasted turn's
+        // index. Restore must anchor at the real carrier's index, replace
+        // the carrier with the saved summary there, and keep the pasted
+        // turn verbatim as user content. The carrier's text differs from
+        // the saved summary so the assertions cannot pass by leaving the
+        // history untouched.
+        let pasted_summary = SystemPrompt::Text(build_compaction_summary_block_text(
+            "Please analyze this text",
+            "",
+        ));
+        let pasted = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: summary_prompt_text(&pasted_summary),
+                cache_control: None,
+            }],
+        };
+        assert!(
+            !is_wire_compaction_checkpoint_message(&pasted),
+            "a pasted summary without the provenance block is user content"
+        );
+        let carrier = compaction_checkpoint_message(&SystemPrompt::Text(
+            build_compaction_summary_block_text("Compacted summary", ""),
+        ));
+        let authoritative = SystemPrompt::Text(build_compaction_summary_block_text(
+            "Authoritative summary",
+            "",
+        ));
+        let restored =
+            restore_compaction_checkpoint(vec![pasted.clone(), carrier], Some(&authoritative));
+        assert_eq!(
+            restored.len(),
+            2,
+            "restore must not drop the pasted turn: {restored:?}"
+        );
+        assert_eq!(
+            restored[0], pasted,
+            "the pasted full summary must survive restore verbatim"
+        );
+        assert!(
+            is_wire_compaction_checkpoint_message(&restored[1]),
+            "the real carrier keeps the anchor position: {restored:?}"
+        );
+        assert_eq!(
+            restored[1],
+            compaction_checkpoint_message(&authoritative),
+            "the saved summary replaces the carrier at its index: {restored:?}"
+        );
     }
 
     #[test]
@@ -2497,6 +2730,17 @@ mod tests {
         assert!(!is_context_window_error(&anyhow::anyhow!(
             "503 Service Unavailable"
         )));
+        // A rejected parameter names a token or a maximum without being a
+        // length overflow; dropping history cannot fix it.
+        for msg in [
+            r#"Invalid request (400): {"message":"max_tokens must be <= 8192","type":"invalid_request_error"}"#,
+            "HTTP 422: temperature exceeds maximum 2",
+        ] {
+            assert!(
+                !is_context_window_error(&anyhow::anyhow!(msg)),
+                "a non-length rejection must not trigger the drop-oldest ladder: `{msg}`",
+            );
+        }
     }
 
     #[test]
@@ -3154,7 +3398,7 @@ mod tests {
         assert_eq!(
             request.max_tokens,
             crate::route_budget::effective_max_output_tokens_for_route(
-                crate::config::ApiProvider::Custom,
+                crate::config::ProviderKind::Custom,
                 "test-model",
                 None,
             )
@@ -3245,6 +3489,7 @@ mod tests {
                             thinking: "retained reasoning ".repeat(2000),
                             signature: None,
                             state: None,
+                            redacted_data: None,
                         },
                     );
                 }
@@ -3688,12 +3933,12 @@ mod tests {
         for (route_label, provider, model) in [
             (
                 "thinking-default route",
-                crate::config::ApiProvider::Deepseek,
+                crate::config::ProviderKind::Deepseek,
                 "deepseek-v4-flash",
             ),
             (
                 "fixed-sampling route",
-                crate::config::ApiProvider::Moonshot,
+                crate::config::ProviderKind::Moonshot,
                 "k3",
             ),
         ] {
@@ -3870,6 +4115,7 @@ mod tests {
                     ContentBlock::Thinking {
                         signature: None,
                         state: None,
+                        redacted_data: None,
                         thinking: thinking.clone(),
                     },
                     ContentBlock::ToolUse {

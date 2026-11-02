@@ -301,7 +301,7 @@ impl ExtensionsSnapshot {
     pub fn from_app(app: &App) -> Self {
         let mut snapshot = Self {
             mcp_generation: app.mcp_snapshot_generation,
-            mcp_initializing: app.mcp_initializing,
+            mcp_initializing: app.mcp_boot_initializing(),
             ..Self::default()
         };
         snapshot.tabs[ExtensionsTab::Hooks.index()] = hooks_model(app, app.ui_locale);
@@ -1274,7 +1274,7 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                 })
                 .flatten();
             // `connecting` is the engine's real in-flight set (#6033): under
-            // lazy boot a configured-but-unstarted server reads "not started",
+            // lazy boot a configured-but-unstarted server reads "not connected",
             // never "connecting".
             let initializing = retry.is_some()
                 || (enabled
@@ -1297,11 +1297,15 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                 tr(locale, MessageId::ExtensionsStateError)
             } else if stale {
                 // Switched on in the file, still off in the live pool.
-                tr(locale, MessageId::SetupStatusNotStarted)
+                tr(locale, MessageId::McpStateDisconnected)
             } else if observed.is_none() {
                 tr(locale, MessageId::ExtensionsStateNotInspected)
             } else if observed.is_some_and(|server| !server.started()) {
-                tr(locale, MessageId::SetupStatusNotStarted)
+                // Nothing in this session has needed it yet. "Not started"
+                // read as a failure to someone whose `codewhale mcp tools`
+                // had just listed its tools from the shell, which is a
+                // separate process with its own connection.
+                tr(locale, MessageId::McpStateDisconnected)
             } else {
                 tr(locale, MessageId::ExtensionsStateDisconnected)
             }
@@ -1309,6 +1313,12 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
             let not_started = enabled
                 && !initializing
                 && (stale || observed.is_none_or(|server| !server.started()));
+            // The live pool knows this server and has simply not needed it:
+            // it has no tool counts to show, only what happens next.
+            let waiting_for_first_use = enabled
+                && !initializing
+                && !stale
+                && observed.is_some_and(|server| !server.started());
             let oauth_capable = config.is_some_and(crate::mcp::mcp_server_oauth_capable);
             let recovery = match observed {
                 Some(server) => server.recovery_kind(oauth_capable),
@@ -1426,6 +1436,9 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                     |(plugin, server)| format!("{plugin}/{server}"),
                 ),
                 description: observed.map_or_else(String::new, |server| {
+                    if waiting_for_first_use {
+                        return server.transport.clone();
+                    }
                     localize(
                         locale,
                         MessageId::ExtensionsMcpSummary,
@@ -1444,6 +1457,10 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                     observed.map_or_else(
                         || tr(locale, MessageId::ExtensionsMcpNotInspected).into_owned(),
                         |server| {
+                            if waiting_for_first_use {
+                                return tr(locale, MessageId::ExtensionsMcpNotConnectedYet)
+                                    .into_owned();
+                            }
                             server.error.clone().unwrap_or_else(|| {
                                 localize(
                                     locale,
@@ -1976,9 +1993,19 @@ impl ExtensionsView {
                 format!("{} · {}{action} · {}", item.label, item.state, item.detail)
             }
             Some(VisibleEntry::Problem(problem)) => problem.to_string(),
-            Some(VisibleEntry::Empty) | None => {
-                tr(self.locale, MessageId::ExtensionsNoItems).into_owned()
-            }
+            Some(VisibleEntry::Empty) | None => self.empty_message(),
+        }
+    }
+
+    fn empty_message(&self) -> String {
+        if self.query.is_empty() {
+            tr(self.locale, MessageId::ExtensionsNoItems).into_owned()
+        } else {
+            localize(
+                self.locale,
+                MessageId::ExtensionsNoMatches,
+                &[("query", &self.query)],
+            )
         }
     }
 }
@@ -2210,13 +2237,41 @@ impl ModalView for ExtensionsView {
         if body.width == 0 || body.height < 5 {
             return;
         }
+        let spacious = body.height >= 16;
+        let status = if spacious && self.pending_remove.is_none() {
+            self.selected_item().map_or_else(
+                || self.selected_status(),
+                |item| {
+                    format!(
+                        "{} · {}\n{}\n{}",
+                        item.label, item.state, item.description, item.detail
+                    )
+                },
+            )
+        } else {
+            self.selected_status()
+        };
+        let status = Paragraph::new(status)
+            .style(Style::default().fg(if self.pending_remove.is_some() {
+                palette::STATUS_WARNING
+            } else {
+                palette::TEXT_MUTED
+            }))
+            .wrap(Wrap { trim: false });
+        let status_height = if spacious {
+            u16::try_from(status.line_count(body.width))
+                .unwrap_or(u16::MAX)
+                .clamp(3, (body.height / 3).max(3))
+        } else {
+            1
+        };
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Min(1),
-                Constraint::Length(if body.height >= 16 { 3 } else { 1 }),
+                Constraint::Length(status_height),
                 Constraint::Length(1),
             ])
             .split(body);
@@ -2360,15 +2415,7 @@ impl ModalView for ExtensionsView {
                     Some(codewhale_palette::ChromeInk::Failure),
                 )),
                 VisibleEntry::Empty => parts.push((
-                    if self.query.is_empty() {
-                        tr(self.locale, MessageId::ExtensionsNoItems).into_owned()
-                    } else {
-                        localize(
-                            self.locale,
-                            MessageId::ExtensionsNoMatches,
-                            &[("query", &self.query)],
-                        )
-                    },
+                    self.empty_message(),
                     Some(codewhale_palette::ChromeInk::MetadataHint),
                 )),
             }
@@ -2401,27 +2448,7 @@ impl ModalView for ExtensionsView {
             hits.rows.push((row_area, entry_index));
         }
 
-        let status = if rows[3].height > 1 && self.pending_remove.is_none() {
-            self.selected_item().map_or_else(
-                || self.selected_status(),
-                |item| {
-                    format!(
-                        "{} · {}\n{}\n{}",
-                        item.label, item.state, item.description, item.detail
-                    )
-                },
-            )
-        } else {
-            self.selected_status()
-        };
-        Paragraph::new(status)
-            .style(Style::default().fg(if self.pending_remove.is_some() {
-                palette::STATUS_WARNING
-            } else {
-                palette::TEXT_MUTED
-            }))
-            .wrap(Wrap { trim: false })
-            .render(rows[3], buf);
+        status.render(rows[3], buf);
         let mut compact_hints = vec![
             super::ActionHint::new("Tab", tr(self.locale, MessageId::ExtensionsActionTabs)),
             super::ActionHint::new("/", tr(self.locale, MessageId::SessionsActionSearch)),
@@ -2576,7 +2603,7 @@ mod tests {
         let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
             .registry_for_workspace(root.path());
         let mut app = App::new_with_plugin_registry(
-            crate::test_support::test_tui_options(root.path()),
+            crate::tui::test_support::test_tui_options(root.path()),
             &crate::config::Config::default(),
             registry,
         );
@@ -2645,10 +2672,25 @@ mod tests {
         assert_eq!((group, github.state.as_str()), ("servers", "connected"));
         assert_eq!(command(github), None);
 
+        // Lazy boot has not needed it: the row says so and says what happens
+        // next, not "not started" over a row of zero counts.
         let (group, playwright) = row("playwright");
         assert_eq!(
             (group, playwright.state.as_str()),
-            ("servers", "not started")
+            ("servers", "not connected")
+        );
+        assert_eq!(playwright.description, "stdio");
+        assert!(
+            playwright
+                .detail
+                .ends_with("Not connected in this session yet. Connects when a tool is needed, or connect it now."),
+            "{}",
+            playwright.detail
+        );
+        assert!(
+            !playwright.detail.contains("tools: 0"),
+            "{}",
+            playwright.detail
         );
         assert_eq!(playwright.tone, ExtensionTone::Idle);
         assert_eq!(
@@ -2690,7 +2732,7 @@ mod tests {
         let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
             .registry_for_workspace(root.path());
         let app = App::new_with_plugin_registry(
-            crate::test_support::test_tui_options(root.path()),
+            crate::tui::test_support::test_tui_options(root.path()),
             &crate::config::Config::default(),
             registry,
         );
@@ -2824,7 +2866,7 @@ mod tests {
         let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
             .registry_for_workspace(root.path());
         let app = App::new_with_plugin_registry(
-            crate::test_support::test_tui_options(root.path()),
+            crate::tui::test_support::test_tui_options(root.path()),
             &crate::config::Config::default(),
             registry,
         );
@@ -2879,7 +2921,7 @@ mod tests {
         let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
             .registry_for_workspace(root.path());
         let app = App::new_with_plugin_registry(
-            crate::test_support::test_tui_options(root.path()),
+            crate::tui::test_support::test_tui_options(root.path()),
             &crate::config::Config::default(),
             registry,
         );
@@ -2908,7 +2950,7 @@ mod tests {
         let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
             .registry_for_workspace(root.path());
         let app = App::new_with_plugin_registry(
-            crate::test_support::test_tui_options(root.path()),
+            crate::tui::test_support::test_tui_options(root.path()),
             &crate::config::Config::default(),
             registry,
         );
@@ -2944,7 +2986,14 @@ mod tests {
         );
         assert!(!builtin.trusted());
         assert!(!builtin.enabled);
-        assert_eq!(group.items.iter().filter(|row| matches!(&row.action, Some(ExtensionAction::Command { command, .. }) if command.starts_with("/plugin marketplace install "))).count(), 5);
+        assert!(
+            group.items.iter().any(|row| matches!(
+                &row.action,
+                Some(ExtensionAction::Command { command, .. })
+                    if command == "/plugin marketplace install codewhale whalewiki"
+            )),
+            "an absent catalog bundle should still offer installation"
+        );
     }
 
     #[test]

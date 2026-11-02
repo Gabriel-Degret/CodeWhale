@@ -35,8 +35,10 @@ Codewhale 在插件上只帮忙，不推销。规则如下：
 - **内置插件从不作为推荐出现。** Computer Use 这类内置插件，
   只会出现在 `/plugin list` 和 Extensions 里。
 - **只认具体词。** 泛化词（accessibility、browser、chrome、docs、screenshot、
-  web、wiki 等）永远不触发推荐。匹配器和市场的 `check-marketplace.mjs`
-  共用同一份停用词表。
+  web、wiki 等）和 Codewhale 自己的词汇（agent、code、data、MCP、model、
+  session、tool）永远不触发推荐，所以问 MCP 服务器为什么卡住，不会冒出某个
+  厂商的插件。有辨识度的名称、短语和域名照常匹配。匹配器和市场的
+  `check-marketplace.mjs` 共用同一份停用词表。
 - **只推荐本机跑得起来的。** 插件的 `when.os` 若排除了当前操作系统，就不会被推荐。
 - **给出真正的下一步。** 模型请求的那一行会按插件的实际需要写成 Install、
   Review trust 或 Enable。只有那个按钮可点，它打开的是 `/plugin show <name>`；
@@ -60,7 +62,7 @@ Codewhale 不会凭空编造远程插件 URL；缺失的插件只会从你添加
 | `chrome-devtools` MCP（`/mcp recommendations`） | 它自己驱动的一个 Chrome，可以包含已登录的页面 | DevTools 级别的检查和性能分析 |
 | Playwright MCP（`/mcp recommendations`） | 带 `--isolated` 的全新隔离 profile | 不带你身份的脚本化流程和测试 |
 | Computer Use 的 `browser_*` 工具（内置，审查前关闭） | 它自己启动的浏览器，用独立的 profile | 更宽泛的桌面任务里的浏览器步骤 |
-| Chromewhale（开发者预览版，`Hmbown/codewhale-plugin-marketplace`） | 你自己的、已经打开的 Chrome profile；以 unpacked 方式加载 | 读取或操作你当前正看的标签页，每次授权一个站点 |
+| Chromewhale（开发者预览版，`codewhale-hq/codewhale-plugin-marketplace`） | 你自己的、已经打开的 Chrome profile；以 unpacked 方式加载 | 读取或操作你当前正看的标签页，每次授权一个站点 |
 
 这些都不会主动推荐给你。按任务需要自己添加。
 

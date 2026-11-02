@@ -20,6 +20,7 @@ export const chrome: ChromeDict = {
   navCommunity: "Cộng đồng",
   navContribute: "Đóng góp",
 
+  navFeatures: "Khả năng",
   navProduct: "Sản phẩm",
   navModels: "Mô hình",
   navPlugins: "Plugin",
@@ -30,8 +31,6 @@ export const chrome: ChromeDict = {
   navHomeAria: "Trang chủ Codewhale",
 
   installCta: "Cài đặt →",
-
-  authSignIn: "Đăng nhập",
 
   dateLocale: "vi-VN",
 
@@ -45,7 +44,7 @@ export const chrome: ChromeDict = {
   themeTitle: "Giao diện · tự động / sáng / tối",
 
   footerTagline:
-    "Tạo những gì bạn muốn và tự động hóa công việc hằng ngày bằng các mô hình bạn chọn.",
+    "Tác nhân lập trình mã nguồn mở cho terminal và những mô hình bạn chọn.",
   footerProduct: "Sản phẩm",
   footerProject: "Dự án",
   footerDocs: "Tài liệu",

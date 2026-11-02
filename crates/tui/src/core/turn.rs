@@ -18,7 +18,7 @@ use crate::core::events::TurnRoute;
 use crate::snapshot::{SnapshotRepo, TakenSnapshot};
 use codewhale_models::Usage;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Which configured limit governs a turn's step budget (#5994).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +30,7 @@ pub enum StepBudgetSource {
 }
 
 impl StepBudgetSource {
-    /// The configuration key named in soft-landing and exhaustion notices.
+    /// The configuration key named in exhaustion notices.
     #[must_use]
     pub const fn key_label(self) -> &'static str {
         match self {
@@ -122,6 +122,50 @@ pub struct TurnContext {
     /// request (capability, auth, unreachable). The turn then fails on that
     /// cause, not on the context budget the recovery was trying to fix.
     pub(crate) context_recovery_rejection: Option<anyhow::Error>,
+
+    pub(crate) auto_review_denials: AutoReviewDenials,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AutoReviewDenials {
+    consecutive: usize,
+    recent: std::collections::VecDeque<bool>,
+    stop: Option<String>,
+}
+
+impl AutoReviewDenials {
+    const CONSECUTIVE: usize = 3;
+    const WINDOW: usize = 50;
+    const WINDOW_DENIALS: usize = 10;
+
+    pub(crate) fn record(&mut self, denied: bool) {
+        if self.stop.is_some() {
+            return;
+        }
+        self.consecutive = if denied { self.consecutive + 1 } else { 0 };
+        if self.recent.len() == Self::WINDOW {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(denied);
+        let denials = self.recent.iter().filter(|denied| **denied).count();
+        let summary = if self.consecutive >= Self::CONSECUTIVE {
+            format!("Auto-Review denied {} actions in a row", self.consecutive)
+        } else if denials >= Self::WINDOW_DENIALS {
+            format!(
+                "Auto-Review denied {denials} of the last {} actions",
+                self.recent.len()
+            )
+        } else {
+            return;
+        };
+        self.stop = Some(format!(
+            "{summary}, so the turn was stopped. Change the request, or switch to Ask."
+        ));
+    }
+
+    pub(crate) fn stop(&self) -> Option<&str> {
+        self.stop.as_deref()
+    }
 }
 
 impl TurnContext {
@@ -159,6 +203,7 @@ impl TurnContext {
             compaction_refusal_notified: false,
             pending_route: None,
             context_recovery_rejection: None,
+            auto_review_denials: AutoReviewDenials::default(),
         }
     }
 
@@ -180,15 +225,10 @@ impl TurnContext {
         self.step_limit().is_some_and(|limit| self.step >= limit)
     }
 
-    /// Model steps consumed so far (for soft-landing and reporting).
+    /// Model steps consumed so far (for reporting).
     #[must_use]
     pub fn steps_used(&self) -> u32 {
         self.step
-    }
-
-    /// Get the elapsed time
-    pub fn elapsed(&self) -> Duration {
-        self.started_at.elapsed()
     }
 
     /// Complete the existing request projection with observed turn-exit facts.
@@ -225,7 +265,8 @@ impl TurnContext {
     /// pressure. Child-model usage must call [`Self::add_usage`] directly so
     /// it cannot masquerade as the parent request's context size.
     pub fn add_parent_usage(&mut self, usage: &Usage) {
-        self.latest_parent_input_tokens = (usage.input_tokens > 0).then_some(usage.input_tokens);
+        let latest = usage.request_usages.last().unwrap_or(usage);
+        self.latest_parent_input_tokens = (latest.input_tokens > 0).then_some(latest.input_tokens);
         self.add_usage(usage);
         add_usage_to(&mut self.parent_route_usage, usage);
     }
@@ -249,6 +290,19 @@ impl TurnContext {
 }
 
 pub(crate) fn add_usage_to(total: &mut Usage, delta: &Usage) {
+    if total.request_usages.is_empty() && (total.input_tokens > 0 || total.output_tokens > 0) {
+        total.request_usages.push(total.clone());
+    }
+    if total.request_usages.len() <= 1024 {
+        if delta.request_usages.is_empty() {
+            total.request_usages.push(delta.clone());
+        } else {
+            let remaining = 1025 - total.request_usages.len();
+            total
+                .request_usages
+                .extend(delta.request_usages.iter().take(remaining).cloned());
+        }
+    }
     total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
     total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
     total.prompt_cache_hit_tokens =
@@ -262,6 +316,10 @@ pub(crate) fn add_usage_to(total: &mut Usage, delta: &Usage) {
         delta.prompt_cache_write_tokens,
     );
     total.reasoning_tokens = add_optional_usage(total.reasoning_tokens, delta.reasoning_tokens);
+    total.input_audio_tokens =
+        add_optional_usage(total.input_audio_tokens, delta.input_audio_tokens);
+    total.output_audio_tokens =
+        add_optional_usage(total.output_audio_tokens, delta.output_audio_tokens);
     total.reasoning_replay_tokens =
         add_optional_usage(total.reasoning_replay_tokens, delta.reasoning_replay_tokens);
     if let Some(delta) = delta.server_tool_use.as_ref() {
@@ -801,69 +859,30 @@ pub(crate) mod test_max_snapshots {
     }
 }
 
-/// Which gate turned snapshots off. Each variant selects its own consequence
-/// and recovery copy: only [`Self::WorkspaceTooLarge`] is lifted by
-/// [`SNAPSHOTS_CAP_CONFIG_KEY`], so the other two must never advertise it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SnapshotsDisabledScope {
-    /// Snapshot-eligible content exceeds `[snapshots] max_workspace_gb`.
-    WorkspaceTooLarge,
-    /// The bounded walk hit the entry ceiling. Raising (or zeroing) the GB cap
-    /// does not lift this bound.
-    TooManyFiles,
-    /// Home, filesystem root, or a top-level home folder: refused for safety,
-    /// and no config value changes that.
-    UnsafeLocation,
-    /// The side repo's HEAD named a missing commit; history was restarted, so
-    /// earlier restore points are gone although new turns are protected.
-    HistoryRepaired,
-    /// Snapshots open but fail (a real git or disk error, not a gate): undo
-    /// cannot restore the turns taken since. `limit` carries the error.
-    Failing,
-}
+// Shared snapshot data; host localization and session retention stay here.
+#[cfg(test)]
+pub use codewhale_command_contract::config_policy::SNAPSHOTS_CAP_CONFIG_KEY;
+pub use codewhale_command_contract::config_policy::{
+    StatusSnapshotNotice as SnapshotsDisabledNotice, StatusSnapshotScope as SnapshotsDisabledScope,
+};
 
-/// Snapshot availability observed for a session and its workspace. Delivering
-/// the notice does not erase the status: `/status` can still explain why undo
-/// is unavailable after the transient toast has expired (#5930).
-///
-/// The notice carries the gate, not prose: every surface renders exactly one
-/// localized line from it, so the workspace, the limit, and the recovery are
-/// each stated once (#6042).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotsDisabledNotice {
-    pub workspace: String,
-    pub scope: SnapshotsDisabledScope,
-    /// Preformatted limit for the scope that names one (`2.0 GB`, `200000`),
-    /// or the failure detail for [`SnapshotsDisabledScope::Failing`]. Empty
-    /// for scopes whose message names neither.
-    pub limit: String,
+/// Host localization of the shared semantic notice, including the toast surface.
+pub trait SnapshotsDisabledNoticeUi {
+    fn localize(&self, locale: codewhale_localization::Locale) -> String;
 }
-
-impl SnapshotsDisabledNotice {
-    fn message_id(&self) -> codewhale_localization::MessageId {
+impl SnapshotsDisabledNoticeUi for SnapshotsDisabledNotice {
+    fn localize(&self, locale: codewhale_localization::Locale) -> String {
         use codewhale_localization::MessageId;
-        match self.scope {
+        let id = match self.scope {
             SnapshotsDisabledScope::WorkspaceTooLarge => MessageId::SnapshotsDisabledTooLarge,
             SnapshotsDisabledScope::TooManyFiles => MessageId::SnapshotsDisabledTooManyFiles,
             SnapshotsDisabledScope::UnsafeLocation => MessageId::SnapshotsDisabledUnsafeLocation,
             SnapshotsDisabledScope::HistoryRepaired => MessageId::SnapshotsHistoryRepaired,
             SnapshotsDisabledScope::Failing => MessageId::SnapshotsFailing,
-        }
-    }
-
-    /// The single user-facing line: what is off, for which workspace, why, and
-    /// the recovery that actually applies to this gate.
-    pub fn localize(&self, locale: codewhale_localization::Locale) -> String {
-        codewhale_localization::tr(locale, self.message_id())
-            .replace("{workspace}", &self.workspace)
-            .replace("{limit}", &self.limit)
-            .replace("{config_key}", SNAPSHOTS_CAP_CONFIG_KEY)
+        };
+        self.render(&codewhale_localization::tr(locale, id))
     }
 }
-
-/// The config key that lifts the size gate. Named only by the size-gate
-/// notice: it is not a remedy for the entry ceiling or the safety refusal.
-pub const SNAPSHOTS_CAP_CONFIG_KEY: &str = "[snapshots] max_workspace_gb";
 
 /// Human-readable byte cap for the size-gate notice. Keeps small test caps
 /// from rendering as a misleading `0 GB`.

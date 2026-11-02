@@ -23,7 +23,6 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
 };
 
 use crate::tools::subagent::SubAgentStatus;
@@ -68,6 +67,8 @@ pub struct AgentFocus {
     /// on an unchanged message count still triggers a rebuild.
     receipt_count: usize,
     last_refresh: Instant,
+    settled_refreshed: bool,
+    wrapped: Option<(u16, codewhale_palette::UiTheme, Vec<Line<'static>>)>,
 }
 
 impl AgentFocus {
@@ -85,6 +86,8 @@ impl AgentFocus {
             last_total: 0,
             receipt_count: 0,
             last_refresh: Instant::now() - REFRESH_INTERVAL,
+            settled_refreshed: false,
+            wrapped: None,
         }
     }
 
@@ -351,6 +354,7 @@ pub(crate) fn focus_agent(app: &mut App, agent_id: &str) {
     focus.result = result_block_for(app, agent_id, &messages);
     focus.last_refresh = Instant::now();
     app.agent_focus = Some(focus);
+    crate::extension_host::command::bump_epoch();
     // The composer is now the natural owner: the next keys address the
     // worker, and Esc leaves focus rather than the rail.
     crate::tui::work_surface::release_focus(app);
@@ -365,6 +369,7 @@ pub(crate) fn focus_agent(app: &mut App, agent_id: &str) {
 
 /// Return to the main conversation. Returns whether a focus was active.
 pub(crate) fn exit_focus(app: &mut App) -> bool {
+    crate::extension_host::command::bump_epoch();
     let Some(focus) = app.agent_focus.take() else {
         return false;
     };
@@ -388,6 +393,14 @@ pub(crate) fn refresh_focus(app: &mut App) {
         return;
     }
     let agent_id = focus.agent_id.clone();
+    let settled = app
+        .subagent_cache
+        .iter()
+        .find(|agent| agent.agent_id == agent_id)
+        .is_some_and(|agent| !matches!(agent.status, SubAgentStatus::Running));
+    if settled && focus.settled_refreshed {
+        return;
+    }
     let (messages, omitted) = resolve_agent_transcript_messages(app, &agent_id);
     let receipts = child_receipts(app, &agent_id).to_vec();
     // The result lands when the agent settles, often with no new message.
@@ -396,8 +409,10 @@ pub(crate) fn refresh_focus(app: &mut App) {
         return;
     };
     focus.last_refresh = Instant::now();
+    focus.settled_refreshed = settled;
     if focus.result != result {
         focus.result = result;
+        focus.wrapped = None;
         app.needs_redraw = true;
     }
     let Some(focus) = app.agent_focus.as_mut() else {
@@ -410,6 +425,7 @@ pub(crate) fn refresh_focus(app: &mut App) {
         return;
     }
     let previous_count = focus.source_message_count;
+    focus.wrapped = None;
     focus.cells = cells_for_messages(&messages, &receipts);
     focus.receipt_count = receipts.len();
     focus.source_message_count = messages.len();
@@ -448,6 +464,7 @@ pub(crate) fn echo_user_follow_up(app: &mut App, text: &str) {
         focus.local_cells.push(HistoryCell::User {
             content: text.to_string(),
         });
+        focus.wrapped = None;
         focus.scroll_top = None;
         app.needs_redraw = true;
     }
@@ -477,9 +494,11 @@ pub(crate) fn apply_follow_up_receipt(
                     .map(|focus| focus.local_cells.clone())
                     .unwrap_or_default();
                 app.agent_focus = None;
+                crate::extension_host::command::bump_epoch();
                 focus_agent(app, &receipt.target_agent_id);
                 if let Some(focus) = app.agent_focus.as_mut() {
                     focus.local_cells = carried;
+                    focus.wrapped = None;
                 }
             }
             app.tr(MessageId::AgentFocusFollowUpContinued)
@@ -518,6 +537,7 @@ pub(crate) fn apply_follow_up_receipt(
         focus.local_cells.push(HistoryCell::System {
             content: note.clone(),
         });
+        focus.wrapped = None;
         focus.scroll_top = None;
     }
     app.status_message = Some(note.clone());
@@ -675,6 +695,7 @@ pub(crate) fn composer_placeholder(app: &App) -> Option<String> {
 /// the jump-to-latest affordance behave exactly as they do on the main
 /// transcript.
 pub(crate) fn render_focus(app: &mut App, area: Rect, buf: &mut Buffer) {
+    let area = area.intersection(buf.area);
     let Some(focus) = app.agent_focus.as_ref() else {
         return;
     };
@@ -727,14 +748,32 @@ pub(crate) fn render_focus(app: &mut App, area: Rect, buf: &mut Buffer) {
             Style::default().fg(theme.text_muted),
         )));
     }
-    for cell in focus
-        .cells
-        .iter()
-        .chain(result_cells.iter())
-        .chain(focus.local_cells.iter())
+    if !focus
+        .wrapped
+        .as_ref()
+        .is_some_and(|(cached_width, cached_theme, _)| {
+            *cached_width == width && *cached_theme == theme
+        })
     {
-        lines.extend(cell.transcript_lines(width));
-        lines.push(Line::default());
+        let mut body = Vec::new();
+        for cell in focus
+            .cells
+            .iter()
+            .chain(result_cells.iter())
+            .chain(focus.local_cells.iter())
+        {
+            body.extend(cell.transcript_lines(width));
+            body.push(Line::default());
+        }
+        if let Some(focus) = app.agent_focus.as_mut() {
+            focus.wrapped = Some((width, theme, body));
+        }
+    }
+    let Some(focus) = app.agent_focus.as_ref() else {
+        return;
+    };
+    if let Some((_, _, body)) = focus.wrapped.as_ref() {
+        lines.extend(body.iter().cloned());
     }
     let visible = usize::from(area.height.saturating_sub(1)).max(1);
     let total = lines.len();
@@ -756,22 +795,19 @@ pub(crate) fn render_focus(app: &mut App, area: Rect, buf: &mut Buffer) {
     focus.last_total = total;
     let top = focus.scroll_top.unwrap_or(max_top);
 
-    let banner_area = Rect::new(area.x, area.y, area.width, 1);
-    Paragraph::new(banner_line)
-        .style(background)
-        .render(banner_area, buf);
-    let body_area = Rect::new(
-        area.x,
-        area.y.saturating_add(1),
-        area.width,
-        area.height.saturating_sub(1),
+    lines.insert(0, banner_line);
+    let mut viewport = codewhale_ratatui::TranscriptViewport::new(&lines);
+    viewport.offset = top;
+    viewport.pinned_rows = 1;
+    viewport.style = background;
+    let plan = viewport.render(area, buf);
+    app.viewport.ocean_semantic_surfaces = codewhale_ratatui::ocean::ocean_semantic_surfaces(
+        plan.display_rows(),
+        plan.area,
+        crate::tui::ui_text::grapheme_display_width,
     );
-    let shown: Vec<Line<'static>> = lines.into_iter().skip(top).take(visible).collect();
-    Paragraph::new(shown)
-        .style(background)
-        .render(body_area, buf);
     // The focused view owns the transcript geometry for paging keys.
-    app.viewport.last_transcript_area = Some(body_area);
+    app.viewport.last_transcript_area = Some(plan.body_area);
     app.viewport.last_transcript_visible = visible;
     app.viewport.last_transcript_total = total;
     app.viewport.last_transcript_top = top;
@@ -792,7 +828,7 @@ mod tests {
                 model: "test-model".to_string(),
                 use_mouse_capture: true,
                 max_subagents: 4,
-                ..crate::test_support::test_tui_options(workspace)
+                ..crate::tui::test_support::test_tui_options(workspace)
             },
             &Config::default(),
         )
@@ -985,6 +1021,7 @@ mod tests {
                 git_branch: None,
                 agent_type: crate::tools::subagent::FleetRole::Scout,
                 assignment: crate::tools::subagent::SubAgentAssignment {
+                    native_preset: None,
                     objective: "look around".to_string(),
                     role: Some("explore".to_string()),
                 },
@@ -1062,6 +1099,7 @@ mod tests {
             git_branch: None,
             agent_type: crate::tools::subagent::FleetRole::Scout,
             assignment: crate::tools::subagent::SubAgentAssignment {
+                native_preset: None,
                 objective: "audit the docs".to_string(),
                 role: Some("explore".to_string()),
             },
@@ -1391,5 +1429,84 @@ mod tests {
             app.agent_focus.as_ref().unwrap().scroll_top.is_none(),
             "following the tail must not flip into a pinned offset"
         );
+    }
+}
+
+#[cfg(test)]
+#[path = "agent_focus/transcript_legacy.rs"]
+mod transcript_legacy;
+
+#[cfg(test)]
+mod mounted_transcript_acceptance {
+    use super::*;
+    use crate::config::Config;
+    use codewhale_localization::Locale;
+    use std::path::PathBuf;
+
+    fn fixture(locale: Locale, offset: Option<usize>) -> App {
+        let mut app = App::new(
+            crate::tui::test_support::test_tui_options(PathBuf::from(".")),
+            &Config::default(),
+        );
+        app.launch.visible = false;
+        app.ui_locale = locale;
+        app.low_motion = true;
+        let mut focus = AgentFocus::new("worker".into(), "Builder 中".into());
+        focus.omitted_messages = 2;
+        focus.cells = vec![
+            HistoryCell::User { content: "Review the changed source".into() },
+            HistoryCell::Assistant { content: "A child receipt with 鲸鱼 cafe\u{0301} and wrapped source.\n\n```rust\nlet x = 1;\n```".into(), streaming: true },
+        ];
+        focus.local_cells.push(HistoryCell::User {
+            content: "Keep this local follow-up".into(),
+        });
+        focus.scroll_top = offset;
+        app.agent_focus = Some(focus);
+        app
+    }
+    #[test]
+    fn mounted_transcript_focused_child_banner_and_scroll_match_frozen_painter() {
+        for &locale in Locale::shipped() {
+            for offset in [None, Some(0), Some(2)] {
+                let (mut actual_app, mut old_app) =
+                    (fixture(locale, offset), fixture(locale, offset));
+                for width in [20, 40, 80, 120] {
+                    for height in [1, 3, 6, 12] {
+                        let area = Rect::new(7, 5, width, height);
+                        let mut actual = Buffer::empty(Rect::new(2, 3, width + 12, height + 8));
+                        for cell in &mut actual.content {
+                            cell.set_symbol("~");
+                        }
+                        let mut expected = actual.clone();
+                        transcript_legacy::render_focus(&mut old_app, area, &mut expected);
+                        render_focus(&mut actual_app, area, &mut actual);
+                        assert_eq!(
+                            actual, expected,
+                            "locale={locale:?} offset={offset:?} area={area:?}"
+                        );
+                        assert_eq!(
+                            actual_app.viewport.last_transcript_area,
+                            old_app.viewport.last_transcript_area
+                        );
+                        assert_eq!(
+                            actual_app.viewport.last_transcript_top,
+                            old_app.viewport.last_transcript_top
+                        );
+                        assert_eq!(
+                            actual_app.viewport.last_transcript_total,
+                            old_app.viewport.last_transcript_total
+                        );
+                        assert_eq!(
+                            actual_app.viewport.last_transcript_visible,
+                            old_app.viewport.last_transcript_visible
+                        );
+                        assert_eq!(
+                            actual_app.agent_focus.as_ref().unwrap().scroll_top,
+                            old_app.agent_focus.as_ref().unwrap().scroll_top
+                        );
+                    }
+                }
+            }
+        }
     }
 }

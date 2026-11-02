@@ -25,8 +25,8 @@ use codewhale_workflow::{
 };
 use codewhale_workflow_js::{
     BudgetSnapshot, DriverError, ProgressEvent, SCHEMA_RAW_PREVIEW_CHARS, SpawnedTask,
-    TaskCompletion, TaskRequest, WORKFLOW_LIFETIME_CAP, WORKFLOW_MAX_CONCURRENT, WorkflowDriver,
-    WorkflowRunCancel, WorkflowVm,
+    TaskCompletion, TaskRequest, WORKFLOW_MAX_CONCURRENT, WorkflowDriver, WorkflowRunCancel,
+    WorkflowVm,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -349,11 +349,14 @@ fn finish_workflow_controller(state: &WorkflowWorkspaceState, record: &WorkflowR
         let payload =
             format!("{summary}\n<codewhale:subagent.done>{receipt}</codewhale:subagent.done>");
         debug_assert!(payload.len() <= WORKFLOW_COMPLETION_MAX_BYTES);
-        let _ = tx.try_send(SubAgentCompletion {
-            owner_session_id: controller.driver.owner_session_id.clone(),
-            agent_id: record.run_id.clone(),
-            payload,
-        });
+        send_terminal_event(
+            tx,
+            SubAgentCompletion {
+                owner_session_id: controller.driver.owner_session_id.clone(),
+                agent_id: record.run_id.clone(),
+                payload,
+            },
+        );
     }
     controllers.remove(&record.run_id);
 }
@@ -661,8 +664,10 @@ enum WorkflowUiEventKind {
     },
     BudgetUpdated {
         total: Option<u64>,
-        spent: u64,
+        spent: Option<u64>,
         remaining: Option<u64>,
+        #[serde(default)]
+        metered: bool,
     },
     Log {
         message: String,
@@ -1162,11 +1167,11 @@ impl ToolSpec for WorkflowTool {
 
     fn description(&self) -> &'static str {
         concat!(
-            "Run named steps through the existing sub-agents with a structured plan, ordered phases, shared budgets and result handoffs. Fleet configures those same sub-agents and roles. ",
-            "Inspect agent(action=\"roster\") before assigning steps; choose saved models or role/profile assignments and respect unavailable routes. ",
-            "Prefer plan for multi-step work. Saved or advanced workflows can use script/source_path; provide exactly one input form. ",
-            "Use action=start for detached orchestration and action=status with run_id to inspect progress. Use action=run when the model needs the final result before continuing. ",
-            "Start a workflow on your own only for broad or staged work (the session [workflow].automatic table, default on). An explicit /workflow invocation is authorization. Do not start a workflow for one-file edits or simple questions."
+            "Run named steps through the existing sub-agents with a structured plan, ordered phases and result handoffs. Independent steps continue after an ordinary child failure; steps with missing required results are skipped. Fleet configures those same sub-agents and roles. ",
+            "A workflow is for broad or staged work: several steps with an order, phases, gates, or a fan-in of results. ",
+            "agent(action=\"roster\") lists the saved models, role/profile assignments, and route availability that steps can be assigned. ",
+            "plan is the structured input form for multi-step work; saved or advanced workflows can use script/source_path; exactly one input form is accepted. ",
+            "action=start runs the orchestration detached and action=status with run_id reports its progress. action=run waits and returns the final result."
         )
     }
 
@@ -1185,7 +1190,7 @@ impl ToolSpec for WorkflowTool {
                 },
                 "script": {
                     "type": "string",
-                    "description": "Workflow JS source. The runtime provides args, task(...), parallel(thunks), pipeline(thunks), log(...), phase(...), and budget. Fan-out syntax: await parallel([() => task({...}), () => task({...})]). parallel() requires one array of zero-argument thunks, not variadic task promises."
+                    "description": "Workflow JS source. The runtime provides args, task(...), parallel(thunks), pipeline(items, ...stages), log(...), phase(...), and budget. Fan-out syntax: await parallel([() => task({...}), () => task({...})]). parallel() requires one array of zero-argument thunks, not variadic task promises."
                 },
                 "source_path": {
                     "type": "string",
@@ -1210,11 +1215,6 @@ impl ToolSpec for WorkflowTool {
                         }
                     ],
                     "description": "JSON value exposed to the script as args. Defaults to null."
-                },
-                "token_budget": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Optional shared Workflow admission cap; omit for no cap. Usage is reconciled when children report completion; already-running parallel children can take aggregate spent past the cap, while later and descendant spawns are rejected once exhausted."
                 },
                 "wait": {
                     "type": "boolean",
@@ -1381,28 +1381,21 @@ async fn start_workflow(
     }
     let mut source = workflow_source(&input, context)?;
     let workflow_cfg = workflow_config_for(&runtime);
-    for (name, value) in [
-        ("max_children", workflow_cfg.max_children),
-        ("max_depth", workflow_cfg.max_depth),
-        ("max_concurrent", workflow_cfg.max_concurrent),
-    ] {
-        if value == 0 {
-            return Err(ToolError::invalid_input(format!(
-                "workflow.{name} must be greater than zero"
-            )));
-        }
+    if workflow_cfg.max_concurrent == 0 {
+        return Err(ToolError::invalid_input(
+            "workflow.max_concurrent must be greater than zero",
+        ));
     }
     if let Some(spec) = source.spec.as_mut() {
         validate_runtime_gates(&mut spec.gates)?;
         spec.validate_for_fleet_with_limits(WorkflowFleetLimits {
-            max_total_agents: (workflow_cfg.max_children as usize)
-                .min(codewhale_workflow::DEFAULT_FLEET_WORKFLOW_MAX_AGENTS),
-            max_depth: (workflow_cfg.max_depth as usize)
-                .min(codewhale_workflow::DEFAULT_FLEET_WORKFLOW_MAX_DEPTH),
+            max_total_agents: workflow_cfg.max_children as usize,
+            max_depth: workflow_cfg.max_depth as usize,
         })
         .map_err(|err| ToolError::invalid_input(format!(
             "Workflow plan exceeds workflow.max_children or workflow.max_depth, or is invalid: {err}"
         )))?;
+        validate_gate_phase_order(spec)?;
     }
     let args = input.get("args").cloned().unwrap_or(Value::Null);
     let token_budget = optional_u64(&input, "token_budget", 0)?;
@@ -2771,8 +2764,6 @@ struct StructuredWorkflowPlan {
     #[serde(default)]
     risk: Option<String>,
     #[serde(default)]
-    max_children: Option<usize>,
-    #[serde(default)]
     token_budget: Option<u64>,
     #[serde(default)]
     phases: Vec<StructuredPlanPhase>,
@@ -2826,7 +2817,9 @@ struct StructuredPlanChild {
     cwd: Option<String>,
 }
 
-fn structured_plan_to_workflow_spec(plan_value: &Value) -> Result<WorkflowSpec, ToolError> {
+pub(crate) fn structured_plan_to_workflow_spec(
+    plan_value: &Value,
+) -> Result<WorkflowSpec, ToolError> {
     if !plan_value.is_object() {
         return Err(ToolError::invalid_input(
             "Workflow plan must be a JSON object with goal and phases/children (or nodes)",
@@ -2953,16 +2946,6 @@ fn structured_plan_to_workflow_spec(plan_value: &Value) -> Result<WorkflowSpec, 
         return Err(ToolError::invalid_input(
             "Workflow plan must include phases, children, or nodes",
         ));
-    }
-
-    let mut total_children = 0usize;
-    count_plan_leaves(&nodes, &mut total_children);
-    if let Some(max_children) = plan.max_children
-        && total_children > max_children
-    {
-        return Err(ToolError::invalid_input(format!(
-            "Workflow plan declares {total_children} children which exceeds max_children={max_children}"
-        )));
     }
 
     let spec = WorkflowSpec {
@@ -3131,7 +3114,7 @@ fn parse_plan_agent_type(raw: Option<&str>) -> Result<AgentType, ToolError> {
 /// pass through the JavaScript author's normalization path.
 fn validate_runtime_gates(gates: &mut [GateSpec]) -> Result<(), ToolError> {
     let mut ids = HashSet::new();
-    for gate in gates {
+    for gate in gates.iter_mut() {
         gate.id = gate.id.trim().to_string();
         if gate.id.is_empty() || !ids.insert(gate.id.clone()) {
             return Err(ToolError::invalid_input(
@@ -3157,23 +3140,80 @@ fn validate_runtime_gates(gates: &mut [GateSpec]) -> Result<(), ToolError> {
                 "Workflow role_start gates are not supported; use role_complete with an explicit prerequisite role",
             ));
         }
+        if gate.blocks_role.as_deref() == Some(gate.role.as_str()) {
+            return Err(ToolError::invalid_input(format!(
+                "Workflow gate `{}` has role and blocks_role both set to `{}`; a gate cannot block \
+                 the role whose completion triggers it, so set blocks_role to a later role",
+                gate.id, gate.role
+            )));
+        }
+    }
+    for gate in gates.iter() {
+        let mut pending: Vec<&str> = gate.blocks_role.as_deref().into_iter().collect();
+        let mut visited = HashSet::new();
+        while let Some(role) = pending.pop() {
+            if role == gate.role {
+                return Err(ToolError::invalid_input(format!(
+                    "Workflow gate `{}` forms a role dependency cycle through `{role}`",
+                    gate.id
+                )));
+            }
+            if visited.insert(role) {
+                pending.extend(
+                    gates
+                        .iter()
+                        .filter(|next| next.role == role)
+                        .filter_map(|next| next.blocks_role.as_deref()),
+                );
+            }
+        }
     }
     Ok(())
 }
 
-fn count_plan_leaves(nodes: &[WorkflowNode], total: &mut usize) {
-    for node in nodes {
-        match node {
-            WorkflowNode::Leaf(_) => *total += 1,
-            WorkflowNode::BranchSet(spec) => count_plan_leaves(&spec.children, total),
-            WorkflowNode::Sequence(spec) => count_plan_leaves(&spec.children, total),
-            WorkflowNode::Reduce(_)
-            | WorkflowNode::TeacherReview(_)
-            | WorkflowNode::LoopUntil(_)
-            | WorkflowNode::Cond(_)
-            | WorkflowNode::Expand(_) => {}
+fn validate_gate_phase_order(spec: &WorkflowSpec) -> Result<(), ToolError> {
+    fn collect(
+        nodes: &[WorkflowNode],
+        first: &mut HashMap<String, usize>,
+        mut order: usize,
+    ) -> Option<usize> {
+        for node in nodes {
+            match node {
+                WorkflowNode::Leaf(leaf) if leaf.profile.is_none() => {
+                    let role = leaf.role.as_ref()?;
+                    first.entry(role.trim().to_lowercase()).or_insert(order);
+                    order += 1;
+                }
+                WorkflowNode::Sequence(sequence) => {
+                    order = collect(&sequence.children, first, order)?;
+                }
+                WorkflowNode::BranchSet(branch)
+                    if !branch.parallel || branch.children.len() <= 1 =>
+                {
+                    order = collect(&branch.children, first, order)?;
+                }
+                _ => return None,
+            }
+        }
+        Some(order)
+    }
+    let mut first = HashMap::new();
+    if collect(&spec.nodes, &mut first, 0).is_none() {
+        return Ok(());
+    }
+    for gate in &spec.gates {
+        if let Some(blocked_role) = gate.blocks_role.as_ref()
+            && let (Some(prerequisite), Some(blocked)) =
+                (first.get(&gate.role), first.get(blocked_role))
+            && blocked < prerequisite
+        {
+            return Err(ToolError::invalid_input(format!(
+                "Workflow gate `{}` blocks earlier role `{blocked_role}` before prerequisite role `{}` can complete; reorder the steps or correct the gate",
+                gate.id, gate.role
+            )));
         }
     }
+    Ok(())
 }
 
 fn read_workflow_source_path(
@@ -3367,7 +3407,7 @@ impl DeclarativeWorkflowLowerer {
         parallel: bool,
     ) -> Result<(), ToolError> {
         self.line(format!(
-            "__results[{}] = await task({});",
+            "__results[{}] = (await parallel([() => task({})]))[0];",
             js_string(&spec.id),
             leaf_task_options_expression(spec, phase, parallel, self.workspace.as_deref())?
         ));
@@ -3431,7 +3471,7 @@ impl DeclarativeWorkflowLowerer {
     fn lower_reduce(&mut self, spec: &ReduceSpec) -> Result<(), ToolError> {
         let inputs = result_inputs_expression(&spec.inputs);
         self.line(format!(
-            "__results[{}] = await task({});",
+            "__results[{}] = (await parallel([() => task({})]))[0];",
             js_string(&spec.id),
             task_options_expression(
                 format!(
@@ -3443,9 +3483,6 @@ impl DeclarativeWorkflowLowerer {
                 None,
                 spec.model_policy.model.as_deref(),
                 false,
-                None,
-                None,
-                None,
                 Some("read_only"),
                 &[],
                 &spec.id,
@@ -3477,24 +3514,6 @@ fn leaf_description(spec: &LeafSpec) -> String {
             "Depends on results: {}",
             spec.depends_on_results.join(", ")
         ));
-    }
-    if spec.budget != BudgetSpec::default() {
-        let mut budget = Vec::new();
-        if let Some(max_steps) = spec.budget.max_steps {
-            budget.push(format!("max_steps={max_steps}"));
-        }
-        if let Some(timeout_secs) = spec.budget.timeout_secs {
-            budget.push(format!("timeout_secs={timeout_secs}"));
-        }
-        if let Some(max_parallel) = spec.budget.max_parallel {
-            budget.push(format!("max_parallel={max_parallel}"));
-        }
-        if let Some(max_tokens) = spec.budget.max_tokens {
-            budget.push(format!("max_tokens={max_tokens}"));
-        }
-        if !budget.is_empty() {
-            metadata.push(format!("Budget: {}", budget.join(", ")));
-        }
     }
     if !metadata.is_empty() {
         description.push_str("\n\nWorkflow metadata:\n");
@@ -3547,9 +3566,6 @@ fn leaf_task_options_expression(
         // Parallel write-capable children default to worktree isolation (#4120).
         // Explicit isolation: shared is the approved same-worktree override.
         worktree,
-        spec.budget.max_tokens,
-        spec.budget.max_steps,
-        spec.budget.timeout_secs,
         Some(write_authority),
         &write_roots,
         &spec.id,
@@ -3631,7 +3647,8 @@ fn leaf_description_expression(spec: &LeafSpec) -> String {
     let required =
         serde_json::to_string(&spec.depends_on_results).expect("dependency IDs serialize to JSON");
     format!(
-        "({required}.forEach(id => {{ if (__results[id] == null) throw new Error('Required Workflow result unavailable: ' + id); }}), {description} + \"\\n\\nInputs:\\n\" + {inputs})"
+        "({required}.forEach(id => {{ if (__results[id] == null) throw new Error('Skipped Workflow step ' + {} + ': Required Workflow result unavailable: ' + id); }}), {description} + \"\\n\\nInputs:\\n\" + {inputs})",
+        js_string(&spec.id)
     )
 }
 
@@ -3642,7 +3659,7 @@ fn result_inputs_expression(inputs: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "[{entries}].map(([id, value]) => \"--- \" + id + \" ---\\n\" + String(value ?? \"\")).join(\"\\n\\n\")"
+        "[{entries}].map(([id, value]) => \"--- \" + id + \" ---\\n\" + String(value ?? \"[unavailable: this step produced no result]\")).join(\"\\n\\n\")"
     )
 }
 
@@ -3704,9 +3721,6 @@ fn task_options_expression(
     profile: Option<&str>,
     model: Option<&str>,
     worktree: bool,
-    token_budget: Option<u64>,
-    max_steps: Option<u32>,
-    wall_time_secs: Option<u64>,
     write_authority: Option<&str>,
     write_roots: &[String],
     label: &str,
@@ -3736,18 +3750,6 @@ fn task_options_expression(
     }
     if worktree {
         fields.push("worktree: true".to_string());
-    }
-    if let Some(token_budget) = token_budget {
-        fields.push(format!("tokenBudget: {token_budget}"));
-    }
-    // Workflow's saved budget uses zero for no additional step cap. Omit
-    // that sentinel at the Agent boundary, where an explicit cap must be
-    // positive and may only narrow inherited authority.
-    if let Some(max_steps) = max_steps.filter(|steps| *steps > 0) {
-        fields.push(format!("maxSteps: {max_steps}"));
-    }
-    if let Some(wall_time_secs) = wall_time_secs {
-        fields.push(format!("wallTimeSecs: {wall_time_secs}"));
     }
     if let Some(write_authority) = write_authority {
         fields.push(format!("writeAuthority: {}", js_string(write_authority)));
@@ -4019,7 +4021,7 @@ impl SubAgentWorkflowDriver {
             child_ids: Arc::new(Mutex::new(Vec::new())),
             child_counter: AtomicU32::new(0),
             queue_tickets: AtomicU64::new(0),
-            max_children: workflow_cfg.max_children.min(WORKFLOW_LIFETIME_CAP as u32),
+            max_children: workflow_cfg.max_children,
             current_phase: Mutex::new(None),
             task_records: Arc::new(Mutex::new(HashMap::new())),
             dead_fanouts: AtomicU32::new(0),
@@ -4803,7 +4805,7 @@ impl SubAgentWorkflowDriver {
         // Rust 1.99 and its `try_update` replacement is newer than the MSRV.
         let mut count = self.child_counter.load(Ordering::SeqCst);
         let workflow_child_index = loop {
-            if count >= self.max_children {
+            if self.max_children > 0 && count >= self.max_children {
                 return Err(DriverError::Rejected(format!(
                     "workflow.max_children limit ({}) reached; reduce remaining work or start a new reviewed plan",
                     self.max_children
@@ -4940,7 +4942,12 @@ impl SubAgentWorkflowDriver {
 
 #[async_trait]
 impl WorkflowDriver for SubAgentWorkflowDriver {
-    async fn spawn_task(&self, request: TaskRequest) -> Result<SpawnedTask, DriverError> {
+    async fn spawn_task(&self, mut request: TaskRequest) -> Result<SpawnedTask, DriverError> {
+        if request.max_depth.take().is_some() {
+            self.progress(ProgressEvent::Log {
+                message: "Ignored model task maxDepth; trusted Fleet, role and parent delegation constraints apply.".to_string(),
+            });
+        }
         let label = request
             .label
             .as_deref()
@@ -4969,6 +4976,10 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
 
     fn cancel_all(&self) {
         self.force_cancel_all();
+    }
+
+    fn budget_is_metered(&self) -> bool {
+        false
     }
 
     fn budget(&self) -> BudgetSnapshot {
@@ -5128,8 +5139,9 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
 fn budget_event_kind(snapshot: BudgetSnapshot) -> WorkflowUiEventKind {
     WorkflowUiEventKind::BudgetUpdated {
         total: snapshot.total,
-        spent: snapshot.spent,
-        remaining: snapshot.remaining(),
+        spent: None,
+        remaining: None,
+        metered: false,
     }
 }
 
@@ -5219,6 +5231,32 @@ fn execution_from_declarative_spec(
     let mut execution = IrWorkflowExecution::default();
     for node in &spec.nodes {
         push_execution_node(node, &by_label, &mut execution);
+    }
+    if terminal_status != WorkflowRunStatus::Running {
+        let status = if terminal_status == WorkflowRunStatus::Cancelled {
+            IrWorkflowRunStatus::Cancelled
+        } else {
+            IrWorkflowRunStatus::Failed
+        };
+        for leaf in &mut execution.leaf_results {
+            if leaf.status == IrWorkflowRunStatus::Pending {
+                leaf.status = status;
+                leaf.output = Some("Skipped: no child was admitted for this step; see dispatch failures and progress for the refusal or missing dependency.".to_string());
+            }
+        }
+        for control in &mut execution.control_node_results {
+            if control.status == IrWorkflowRunStatus::Pending {
+                control.status = status;
+            }
+        }
+        for branch in &mut execution.branch_results {
+            if branch.status == IrWorkflowRunStatus::Pending {
+                branch.status = status;
+            }
+        }
+        if execution.status == IrWorkflowRunStatus::Pending {
+            execution.status = status;
+        }
     }
     let mut leaf_usage = execution.leaf_results.iter().map(|leaf| leaf.usage);
     execution.usage = leaf_usage
@@ -5762,7 +5800,7 @@ pub(crate) fn structcopy_run_projection(
 /// One workflow run as the human-facing `/workflow` command reads it: a
 /// bounded projection of the run record with no raw event payloads and no
 /// filesystem paths beyond the source file name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct HostWorkflowRunLine {
     pub run_id: String,
     /// Human-facing stage derived from the durable owner record and its typed
@@ -5859,7 +5897,8 @@ fn host_workflow_state(workspace: &Path) -> Option<Arc<WorkflowWorkspaceState>> 
     // No live state yet: hydrate only if a journal already exists so
     // status/cancel can see runs from a previous process without creating
     // files in a workspace that never ran a workflow.
-    workflow_journal_exists(workspace).then(|| shared_workflow_state(workspace))
+    workflow_journal_exists(workspace)
+        .then(|| WorkflowWorkspaceState::open_preserving_running(workspace))
 }
 
 /// Cancel hydrates an on-disk journal without the restart-orphan Failed
@@ -5911,7 +5950,7 @@ pub(crate) fn host_workflow_runs(
 /// and a terminal state derived from the task-completed event (`running`
 /// until one exists). Same bounded projection rules as
 /// [`HostWorkflowRunLine`]: no raw event payloads, no filesystem paths.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct HostWorkflowChildRow {
     pub task_id: String,
     pub label: Option<String>,
@@ -5927,7 +5966,7 @@ pub(crate) struct HostWorkflowChildRow {
 /// from the bounded event tail, so a long run shows the newest phases and
 /// children, not the whole history. Read-only: never creates the journal or
 /// workspace state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct HostWorkflowRunDetail {
     pub line: HostWorkflowRunLine,
     pub phases: Vec<String>,
@@ -6385,6 +6424,39 @@ mod tests {
         assert!(body.contains("prove the report artifact"), "{body}");
         assert!(body.contains("phase: scan"), "{body}");
         assert!(body.contains("\"confirmed\": 2"), "{body}");
+    }
+
+    /// A workspace that ships `.codewhale/reports` as a link cannot make the
+    /// run report or the raw schema reply land outside the workspace.
+    #[cfg(unix)]
+    #[test]
+    fn report_artifacts_are_never_written_through_a_linked_reports_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir_all(tmp.path().join(".codewhale")).expect("mkdir");
+        std::os::unix::fs::symlink(
+            outside.path(),
+            tmp.path().join(".codewhale").join("reports"),
+        )
+        .expect("link");
+        let mut record = WorkflowRunRecord::new(
+            "workflow_report_linked".to_string(),
+            Some("session-test".to_string()),
+            None,
+            None,
+            None,
+        );
+        record.status = WorkflowRunStatus::Completed;
+
+        write_run_report_artifact(tmp.path(), &record);
+        let schema = write_schema_raw_artifact(tmp.path(), "run-linked", "agent_0001", 1, "raw");
+
+        assert!(schema.is_none(), "the schema artifact must be refused");
+        assert_eq!(
+            std::fs::read_dir(outside.path()).expect("outside").count(),
+            0,
+            "nothing may land behind the link"
+        );
     }
 
     #[test]
@@ -7780,7 +7852,7 @@ permissions = "read_only"
     }
 
     #[test]
-    fn declarative_leaf_budget_reaches_task_runtime_options() {
+    fn declarative_legacy_budget_options_do_not_instruct_child_stopping() {
         let source = r#"
 workflow({
   "goal": "bound one child",
@@ -7795,17 +7867,9 @@ workflow({
 "#;
 
         let adapted = adapt_workflow_source(source, None).expect("lower bounded leaf");
-        assert!(
-            adapted.source.contains("tokenBudget: 5000"),
-            "{}",
-            adapted.source
-        );
-        assert!(adapted.source.contains("maxSteps: 4"), "{}", adapted.source);
-        assert!(
-            adapted.source.contains("wallTimeSecs: 90"),
-            "{}",
-            adapted.source
-        );
+        for legacy in ["tokenBudget:", "maxSteps:", "wallTimeSecs:", "Budget:"] {
+            assert!(!adapted.source.contains(legacy), "{}", adapted.source);
+        }
     }
 
     #[tokio::test]
@@ -7815,7 +7879,7 @@ workflow({
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls) = fake_chat_client("Completed without a turn cap.").await;
+        let (client, calls, api_config) = fake_chat_client("Completed without a turn cap.").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -7823,7 +7887,8 @@ workflow({
             true,
             None,
             manager.clone(),
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(manager, runtime);
 
         let result = tool
@@ -7941,7 +8006,7 @@ workflow({
 
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls) = fake_chat_client("scout evidence").await;
+        let (client, calls, api_config) = fake_chat_client("scout evidence").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -7949,7 +8014,8 @@ workflow({
             true,
             None,
             manager,
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
         let result = tool
             .execute(
@@ -8654,10 +8720,10 @@ export default workflow({
         .unwrap_err();
         assert!(missing_goal.to_string().contains("goal"), "{missing_goal}");
 
-        let over_limit = workflow_source(
+        let legacy_limit = workflow_source(
             &json!({
                 "plan": {
-                    "goal": "too many children",
+                    "goal": "legacy model limit does not stop work",
                     "max_children": 1,
                     "children": [
                         { "id": "a", "prompt": "one" },
@@ -8667,11 +8733,9 @@ export default workflow({
             }),
             &ctx,
         )
-        .unwrap_err();
-        assert!(
-            over_limit.to_string().contains("max_children"),
-            "{over_limit}"
-        );
+        .expect("legacy model-selected child cap is ignored");
+        assert!(legacy_limit.source.contains("one"));
+        assert!(legacy_limit.source.contains("two"));
 
         let bad_type = workflow_source(
             &json!({
@@ -8850,7 +8914,7 @@ export default workflow({
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls) = fake_chat_client("child done").await;
+        let (client, calls, api_config) = fake_chat_client("child done").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -8858,7 +8922,8 @@ export default workflow({
             true,
             None,
             manager.clone(),
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(manager.clone(), runtime);
 
         let result = tool
@@ -8941,9 +9006,8 @@ export default workflow({
         assert_eq!(child.status, SubAgentStatus::Completed);
         assert_eq!(child.result.as_deref(), Some("child done"));
 
-        // Full receipt chain: the spawn-minted event survives the JSONL
-        // journal reload, hydrates the live projection, and round-trips into
-        // history without following a later route or inventing missing usage.
+        // The spawn-minted receipt survives the JSONL journal reload with
+        // the requested and resolved route fields intact.
         let reloaded = WorkflowWorkspaceState::open(tmp.path());
         let persisted = reloaded
             .runs
@@ -8965,63 +9029,6 @@ export default workflow({
         assert_eq!(persisted_started["resolved_provider"], "deepseek");
         assert_eq!(persisted_started["resolved_model"], "deepseek-v4-flash");
         assert_eq!(persisted_started["route_source"], "task.model");
-
-        let mut panel =
-            crate::tui::widgets::workflow_panel::WorkflowPanel::from_run_json(&persisted_json)
-                .expect("journal should hydrate workflow panel");
-        let original_receipt = panel
-            .phases
-            .iter()
-            .flat_map(|phase| phase.rows.iter())
-            .find(|row| row.task_id == child_id)
-            .map(crate::tui::widgets::workflow_panel::row_receipt_text)
-            .expect("spawned child receipt");
-        assert!(original_receipt.contains("deepseek/deepseek-v4-flash"));
-        assert!(original_receipt.contains("reasoning low→"));
-        assert!(original_receipt.contains("via task.model"));
-
-        panel.apply_json_event(&json!({
-            "type": "task_started",
-            "at_ms": 9_000,
-            "task_id": "later-route",
-            "label": "later-route",
-            "resolved_role": "consultant",
-            "resolved_provider": "moonshot",
-            "resolved_model": "kimi-k3",
-            "requested_reasoning": "auto",
-            "effective_reasoning": "medium",
-            "route_source": "agent_profile.model",
-            "worktree": false,
-        }));
-        panel.apply_json_event(&json!({
-            "type": "task_completed",
-            "at_ms": 9_100,
-            "task_id": "later-route",
-            "status": "succeeded"
-        }));
-        let unchanged = panel
-            .phases
-            .iter()
-            .flat_map(|phase| phase.rows.iter())
-            .find(|row| row.task_id == child_id)
-            .map(crate::tui::widgets::workflow_panel::row_receipt_text)
-            .expect("original child after later route");
-        assert_eq!(unchanged, original_receipt);
-
-        let history =
-            crate::tui::widgets::workflow_panel::WorkflowPanel::from_run_json(&panel.to_run_json())
-                .expect("history receipt round trip");
-        let later_receipt = history
-            .phases
-            .iter()
-            .flat_map(|phase| phase.rows.iter())
-            .find(|row| row.task_id == "later-route")
-            .map(crate::tui::widgets::workflow_panel::row_receipt_text)
-            .expect("later route history receipt");
-        assert!(later_receipt.contains("moonshot/kimi-k3"));
-        assert!(later_receipt.contains("reasoning auto→medium"));
-        assert!(later_receipt.contains("tokens unknown"));
-        assert!(!later_receipt.contains("tokens 0"));
     }
 
     #[tokio::test]
@@ -9044,7 +9051,7 @@ reviewer = "reviewer"
 
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls) = fake_chat_client("role-resolved child").await;
+        let (client, calls, api_config) = fake_chat_client("role-resolved child").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -9052,7 +9059,8 @@ reviewer = "reviewer"
             true,
             None,
             manager.clone(),
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(manager, runtime);
 
         let completed = tool
@@ -9122,7 +9130,7 @@ reviewer = "reviewer"
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
-        let (client, calls) = fake_chat_client("ok").await;
+        let (client, calls, api_config) = fake_chat_client("ok").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -9130,7 +9138,8 @@ reviewer = "reviewer"
             true,
             None,
             manager.clone(),
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(manager.clone(), runtime);
 
         let result = tool
@@ -9181,7 +9190,7 @@ reviewer = "reviewer"
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls) = fake_chat_client("reduce-with-partial").await;
+        let (client, calls, api_config) = fake_chat_client("reduce-with-partial").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -9189,7 +9198,8 @@ reviewer = "reviewer"
             true,
             None,
             manager,
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
 
         let result = tool
@@ -9290,7 +9300,7 @@ reviewer = "reviewer"
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls) = fake_chat_client("unused").await;
+        let (client, calls, api_config) = fake_chat_client("unused").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -9298,7 +9308,8 @@ reviewer = "reviewer"
             true,
             None,
             manager,
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
 
         let result = tool
@@ -9343,7 +9354,7 @@ reviewer = "reviewer"
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls) = fake_chat_client("child done").await;
+        let (client, calls, api_config) = fake_chat_client("child done").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -9351,7 +9362,8 @@ reviewer = "reviewer"
             true,
             None,
             manager,
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
 
         let result = tool
@@ -9395,7 +9407,7 @@ reviewer = "reviewer"
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls) = fake_chat_client("unused").await;
+        let (client, calls, api_config) = fake_chat_client("unused").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -9403,7 +9415,8 @@ reviewer = "reviewer"
             true,
             None,
             manager,
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
 
         let result = tool
@@ -9484,7 +9497,7 @@ reviewer = "reviewer"
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls) = fake_chat_client("child done").await;
+        let (client, calls, api_config) = fake_chat_client("child done").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -9492,7 +9505,8 @@ reviewer = "reviewer"
             true,
             None,
             manager,
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
 
         let result = tool
@@ -9533,7 +9547,7 @@ reviewer = "reviewer"
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls) = fake_chat_client("unused").await;
+        let (client, calls, api_config) = fake_chat_client("unused").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -9541,7 +9555,8 @@ reviewer = "reviewer"
             true,
             None,
             manager,
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
 
         let result = tool
@@ -9604,7 +9619,7 @@ reviewer = "reviewer"
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls) = fake_chat_client("child done").await;
+        let (client, calls, api_config) = fake_chat_client("child done").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -9612,7 +9627,8 @@ reviewer = "reviewer"
             true,
             None,
             manager,
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
 
         let result = tool
@@ -9650,7 +9666,8 @@ reviewer = "reviewer"
             let tmp = tempfile::tempdir().expect("tempdir");
             let ctx = ToolContext::new(tmp.path().to_path_buf());
             let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-            let (client, calls, bodies) = fake_chat_client_capturing("upstream-output").await;
+            let (client, calls, bodies, api_config) =
+                fake_chat_client_capturing("upstream-output").await;
             let runtime = SubAgentRuntime::new(
                 client,
                 "deepseek-v4-flash".to_string(),
@@ -9658,7 +9675,8 @@ reviewer = "reviewer"
                 true,
                 None,
                 manager,
-            );
+            )
+            .with_api_config(api_config);
             let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
             let mut upstream = vec![json!({
                 "id": "__proto__", "prompt": "Produce the upstream finding.", "role": "reviewer"
@@ -9726,6 +9744,50 @@ reviewer = "reviewer"
                 assert_eq!(task_phases, ["inspect", "finish"]);
             }
         }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+        let (client, calls, _bodies, api_config) =
+            fake_chat_client_capturing("independent-output").await;
+        let runtime = SubAgentRuntime::new(
+            client,
+            "deepseek-v4-flash".to_string(),
+            ctx.clone(),
+            true,
+            None,
+            manager,
+        )
+        .with_api_config(api_config);
+        let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
+        let result = tool.execute(json!({
+            "action":"run", "plan":{
+                "goal":"retain independent work after a failed sequential step", "nodes":[
+                    {"sequence":{"id":"steps", "children":[
+                        {"agent":{"id":"missing", "prompt":"missing profile", "agent_type":"review", "profile":"required-profile-does-not-exist"}},
+                        {"agent":{"id":"dependent", "prompt":"must not run", "agent_type":"review", "depends_on_results":["missing"]}},
+                        {"agent":{"id":"independent", "prompt":"finish independent work", "agent_type":"review"}}
+                    ]}}
+                ]
+            }
+        }), &ctx).await.expect("settled sequential receipt");
+        let payload: Value = serde_json::from_str(&result.content).expect("json");
+        assert_eq!(payload["status"], "degraded", "{payload}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{payload}");
+        assert_eq!(payload["result"]["independent"], "independent-output");
+        assert!(payload["result"]["dependent"].is_null());
+        assert!(
+            payload
+                .to_string()
+                .contains("Skipped Workflow step dependent")
+        );
+        assert!(
+            payload["execution"]["leaf_results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|leaf| leaf["status"] != "pending")
+        );
     }
 
     #[tokio::test]
@@ -9735,7 +9797,8 @@ reviewer = "reviewer"
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls, bodies) = fake_chat_client_capturing("upstream-output").await;
+        let (client, calls, bodies, api_config) =
+            fake_chat_client_capturing("upstream-output").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -9743,7 +9806,8 @@ reviewer = "reviewer"
             true,
             None,
             manager,
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
 
         let result = tool
@@ -10483,7 +10547,7 @@ reviewer = "reviewer"
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls) =
+        let (client, calls, api_config) =
             fake_chat_client("BLOCK\nFINAL RECEIPT\n- missing terminal evidence").await;
         let runtime = SubAgentRuntime::new(
             client,
@@ -10492,7 +10556,8 @@ reviewer = "reviewer"
             true,
             None,
             manager,
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
 
         let result = tool
@@ -10711,7 +10776,7 @@ reviewer = "reviewer"
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, _calls) = fake_chat_client("status-output").await;
+        let (client, _calls, api_config) = fake_chat_client("status-output").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -10719,7 +10784,8 @@ reviewer = "reviewer"
             true,
             None,
             manager,
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
 
         let run = tool
@@ -10776,7 +10842,7 @@ reviewer = "reviewer"
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, _calls) = fake_chat_client("journal-output").await;
+        let (client, _calls, api_config) = fake_chat_client("journal-output").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -10784,7 +10850,8 @@ reviewer = "reviewer"
             true,
             None,
             manager.clone(),
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(manager.clone(), runtime.clone());
 
         let run = tool
@@ -10830,72 +10897,126 @@ reviewer = "reviewer"
     #[allow(clippy::await_holding_lock)]
     async fn workflow_status_surfaces_schema_failure_instead_of_null_success() {
         let _retry_guard = workflow_test_retry_guard();
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
-        let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, _calls) = fake_chat_client(r#"{"refuted":"yes"}"#).await;
-        let runtime = SubAgentRuntime::new(
-            client,
-            "deepseek-v4-flash".to_string(),
-            ctx.clone(),
-            true,
-            None,
-            manager.clone(),
-        );
-        let tool = WorkflowTool::new(manager, runtime);
-
-        let run = tool
-            .execute(
-                json!({
-                    "action": "run",
-                    "script": r#"
-                    return await parallel([
-                        () => task({
-                            description: "Return the schema fixture.",
-                            responseSchema: {
-                                type: "object",
-                                properties: { refuted: { type: "boolean" } },
-                                required: ["refuted"],
-                            },
-                        }),
-                    ]);
-                    "#
-                }),
-                &ctx,
+        for agent_type in ["review", "general"] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let ctx = ToolContext::new(tmp.path().to_path_buf());
+            let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+            let (client, calls, bodies, api_config) =
+                fake_chat_client_capturing(r#"{"refuted":"yes"}"#).await;
+            let runtime = SubAgentRuntime::new(
+                client,
+                "deepseek-v4-flash".to_string(),
+                ctx.clone(),
+                true,
+                None,
+                manager.clone(),
             )
-            .await
-            .expect("workflow run returns a record");
-        let run_payload: Value = serde_json::from_str(&run.content).expect("run json");
+            .with_api_config(api_config);
+            let tool = WorkflowTool::new(manager, runtime);
 
-        assert_eq!(run_payload["status"], "failed");
-        assert!(run_payload["result"].is_null());
-        assert!(
-            run_payload["error"]
-                .as_str()
-                .unwrap()
-                .contains("responseSchema validation")
-        );
-        assert!(
-            run_payload["progress"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|message| message
+            let run = tool
+                .execute(
+                    json!({
+                        "action": "run",
+                        "script": r#"
+                        return await parallel([
+                            () => task({
+                                type: "AGENT_TYPE",
+                                description: "Return the schema fixture.",
+                                responseSchema: {
+                                    type: "object",
+                                    properties: { refuted: { type: "boolean" } },
+                                    required: ["refuted"],
+                                },
+                            }),
+                        ]);
+                        "#.replace("AGENT_TYPE", agent_type)
+                    }),
+                    &ctx,
+                )
+                .await
+                .expect("workflow run returns a record");
+            let run_payload: Value = serde_json::from_str(&run.content).expect("run json");
+
+            assert_eq!(run_payload["status"], "failed");
+            assert!(run_payload["result"].is_null());
+            assert!(
+                run_payload["error"]
                     .as_str()
-                    .is_some_and(|message| message.contains("schema validation failed"))),
-            "schema validation error should be visible in the run receipt: {run_payload}"
-        );
-        assert!(
-            run_payload["events"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|event| event["type"] == "task_schema_validation_failed"
-                    && event["message"]
+                    .unwrap()
+                    .contains("responseSchema validation")
+            );
+            assert!(
+                run_payload["progress"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message
                         .as_str()
-                        .is_some_and(|message| message.contains("responseSchema validation"))),
-            "schema validation event should be visible in the typed receipt: {run_payload}"
-        );
+                        .is_some_and(|message| message.contains("schema validation failed"))),
+                "schema validation error should be visible in the run receipt: {run_payload}"
+            );
+            assert!(
+                run_payload["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["type"] == "task_schema_validation_failed"
+                        && event["message"]
+                            .as_str()
+                            .is_some_and(|message| message.contains("responseSchema validation"))),
+                "schema validation event should be visible in the typed receipt: {run_payload}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "one repair re-ask");
+            let bodies = bodies.lock().expect("captured schema requests");
+            let system = bodies[0]["messages"]
+                .as_array()
+                .expect("first request messages")
+                .iter()
+                .filter(|message| matches!(message["role"].as_str(), Some("system" | "developer")))
+                .map(|message| message["content"].as_str().expect("system text"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if agent_type == "review" {
+                assert!(
+                    system.contains("For this read-only Workflow task"),
+                    "{system}"
+                );
+                assert!(
+                    system.contains(
+                        &json!({
+                            "type": "object",
+                            "properties": { "refuted": { "type": "boolean" } },
+                            "required": ["refuted"],
+                        })
+                        .to_string()
+                    ),
+                    "{system}"
+                );
+                assert!(
+                    !system.contains("## Output contract (mandatory)"),
+                    "{system}"
+                );
+                assert!(
+                    !system.contains("## Verify-before-return (write child)"),
+                    "{system}"
+                );
+            } else {
+                assert!(
+                    !system.contains("For this read-only Workflow task"),
+                    "{system}"
+                );
+                assert!(
+                    system.contains("## Output contract (mandatory)"),
+                    "{system}"
+                );
+                assert!(
+                    system.contains("## Verify-before-return (write child)"),
+                    "{system}"
+                );
+                assert!(system.contains("VERDICT: PASS | FAIL"), "{system}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -10908,7 +11029,7 @@ reviewer = "reviewer"
         // The #5583 report shape: attempt 1 wraps valid JSON in prose (a
         // parse failure), the bounded repair answers with bare corrected
         // JSON. Two model calls, no more — the fake server panics on extras.
-        let (client, calls) = fake_chat_client_responses(&[
+        let (client, calls, api_config) = fake_chat_client_responses(&[
             "Sure — here it is:\n```json\n{\"refuted\": true}\n```\nDone!",
             "{\"refuted\": true}",
         ])
@@ -10920,7 +11041,8 @@ reviewer = "reviewer"
             true,
             None,
             manager.clone(),
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(manager, runtime);
 
         let run = tool
@@ -11056,7 +11178,7 @@ reviewer = "reviewer"
             crate::tools::plan::new_shared_plan_state(),
         ));
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
-        let (client, calls) = fake_chat_client("audited").await;
+        let (client, calls, api_config) = fake_chat_client("audited").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -11064,7 +11186,8 @@ reviewer = "reviewer"
             true,
             None,
             manager,
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
 
         let result = tool
@@ -11270,7 +11393,7 @@ FINAL RECEIPT
 - run_completed: crates/tui/src/tools/workflow/mod.rs: WorkflowUiEventKind::RunCompleted -> terminal_completed_receipt
 - lane_exit: crates/lane/src/runtime.rs: process_exit_receipt -> lane_reconciled"#,
         ];
-        let (client, calls) = fake_chat_client_responses(&responses).await;
+        let (client, calls, api_config) = fake_chat_client_responses(&responses).await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -11278,7 +11401,8 @@ FINAL RECEIPT
             true,
             None,
             manager,
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
 
         let result = tool
@@ -11490,7 +11614,7 @@ FINAL RECEIPT
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls) = fake_chat_client("telemetry-output").await;
+        let (client, calls, api_config) = fake_chat_client("telemetry-output").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -11498,7 +11622,8 @@ FINAL RECEIPT
             true,
             None,
             manager,
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
 
         let run = tool
@@ -12065,7 +12190,7 @@ FINAL RECEIPT
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
-        let (client, calls) = fake_chat_client("child done").await;
+        let (client, calls, api_config) = fake_chat_client("child done").await;
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
         let runtime = SubAgentRuntime::new(
             client,
@@ -12074,7 +12199,8 @@ FINAL RECEIPT
             true,
             Some(event_tx),
             manager.clone(),
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(manager.clone(), runtime);
 
         let started = tool
@@ -12179,7 +12305,7 @@ FINAL RECEIPT
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, calls, bodies) = fake_chat_client_capturing("budgeted").await;
+        let (client, calls, bodies, api_config) = fake_chat_client_capturing("budgeted").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -12187,7 +12313,8 @@ FINAL RECEIPT
             true,
             None,
             manager.clone(),
-        );
+        )
+        .with_api_config(api_config);
         let tool = WorkflowTool::new(manager.clone(), runtime);
 
         let result = tool
@@ -12207,11 +12334,18 @@ FINAL RECEIPT
         let payload: Value = serde_json::from_str(&result.content).expect("json result");
 
         assert_eq!(payload["status"], "completed", "{payload}");
-        // #6189 removed per-scope token tracking: `spent` is deliberately 0
-        // and the declared ceiling survives only as a reported total.
-        assert_eq!(payload["result"]["spent"], 0, "{payload}");
+        // #6189 removed per-scope token tracking: usage is unknown,
+        // and the declared hint survives only as a reported total.
+        assert!(payload["result"]["spent"].is_null(), "{payload}");
         assert_eq!(payload["result"]["total"], 1000);
-        assert_eq!(payload["result"]["remaining"], 1000);
+        assert!(payload["result"]["remaining"].is_null(), "{payload}");
+        for event in payload["events"].as_array().expect("events") {
+            if event["type"] == "budget_updated" {
+                assert_eq!(event["metered"], false);
+                assert!(event["spent"].is_null());
+                assert!(event["remaining"].is_null());
+            }
+        }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let bodies = bodies.lock().expect("captured first request");
         let max_tokens = bodies[0]
@@ -12801,7 +12935,7 @@ FINAL RECEIPT
                     let requested = Arc::clone(&requested);
                     let release = Arc::clone(&release);
                     let calls = Arc::clone(&calls);
-                    move |Json(_body): Json<Value>| {
+                    move |Json(body): Json<Value>| {
                         let requested = Arc::clone(&requested);
                         let release = Arc::clone(&release);
                         let calls = Arc::clone(&calls);
@@ -12809,23 +12943,11 @@ FINAL RECEIPT
                             calls.fetch_add(1, Ordering::SeqCst);
                             requested.notify_one();
                             release.notified().await;
-                            Json(json!({
-                                "id": "chatcmpl-journal-probe",
-                                "model": "deepseek-v4-flash",
-                                "choices": [{
-                                    "index": 0,
-                                    "message": {
-                                        "role": "assistant",
-                                        "content": "JOURNAL_CHILD_COMPLETED"
-                                    },
-                                    "finish_reason": "stop"
-                                }],
-                                "usage": {
-                                    "prompt_tokens": 1,
-                                    "completion_tokens": 1,
-                                    "total_tokens": 2
-                                }
-                            }))
+                            fake_chat_response(
+                                body["stream"].as_bool().unwrap_or(false),
+                                "chatcmpl-journal-probe".to_string(),
+                                "JOURNAL_CHILD_COMPLETED",
+                            )
                         }
                     }
                 }),
@@ -12856,6 +12978,7 @@ FINAL RECEIPT
                 Some(event_tx),
                 manager.clone(),
             )
+            .with_api_config(config)
             .with_parent_completion_tx(completion_tx);
             let parent_cancel = runtime.cancel_token.clone();
             let tool = WorkflowTool::new(manager, runtime);
@@ -13350,23 +13473,21 @@ FINAL RECEIPT
         );
         assert_eq!(driver.child_counter.load(Ordering::SeqCst), 1);
         assert!(driver.child_ids.lock().expect("children").is_empty());
-        for name in ["max_children", "max_concurrent", "max_depth"] {
-            let mut config = serde_json::to_value(codewhale_config::WorkflowConfigToml::default())
-                .expect("config");
-            config[name] = json!(0);
-            set_session_workflow_config(
-                tmp.path(),
-                serde_json::from_value(config).expect("zero config"),
-            );
-            let error = tool
-                .execute(json!({"action":"start", "script":"return 1;"}), &context)
-                .await
-                .expect_err("zero ceiling fails without waiting on a semaphore");
-            assert!(
-                error.to_string().contains(&format!("workflow.{name}")),
-                "{error}"
-            );
-        }
+        set_session_workflow_config(
+            tmp.path(),
+            codewhale_config::WorkflowConfigToml {
+                max_concurrent: 0,
+                ..Default::default()
+            },
+        );
+        let error = tool
+            .execute(json!({"action":"start", "script":"return 1;"}), &context)
+            .await
+            .expect_err("zero concurrency fails without waiting on a semaphore");
+        assert!(
+            error.to_string().contains("workflow.max_concurrent"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -13393,6 +13514,75 @@ FINAL RECEIPT
         }
     }
 
+    #[test]
+    fn native_gate_that_blocks_its_own_role_is_rejected_at_admission() {
+        let mut gates: Vec<GateSpec> = serde_json::from_value(json!([{
+            "id": "v1", "gate": "verify", "on": "role_complete", "role": "implement",
+            "blocks_role": "implement", "on_fail": "escalate", "max_retries": 1,
+            "require_explicit_verdict": true
+        }]))
+        .expect("gates");
+        let error = validate_runtime_gates(&mut gates).expect_err("gate blocks its own role");
+        let message = error.to_string();
+        for needle in ["`v1`", "blocks_role", "`implement`"] {
+            assert!(message.contains(needle), "{message}");
+        }
+        gates[0].blocks_role = Some(" Implement ".to_string());
+        assert!(validate_runtime_gates(&mut gates).is_err());
+        gates[0].blocks_role = Some("verify".to_string());
+        validate_runtime_gates(&mut gates).expect("blocking a later role stays valid");
+        let mut reverse = gates[0].clone();
+        reverse.id = "reverse".to_string();
+        reverse.role = "verify".to_string();
+        reverse.blocks_role = Some("implement".to_string());
+        gates.push(reverse);
+        assert!(
+            validate_runtime_gates(&mut gates)
+                .unwrap_err()
+                .to_string()
+                .contains("cycle")
+        );
+        let mut board = LaneGateBoard::new("cycle");
+        board.install_gates(&gates);
+        assert!(board.role_is_blocked(&gates, "implement").is_some());
+        assert!(board.role_is_blocked(&gates, "verify").is_some());
+        gates.pop();
+        for backward in [false, true] {
+            let mut phases = vec![
+                json!({"children":[{"prompt":"implement", "role":"implement"}]}),
+                json!({"children":[{"prompt":"verify", "role":"verify"}]}),
+            ];
+            if backward {
+                phases.reverse();
+            }
+            let mut spec = structured_plan_to_workflow_spec(&json!({
+                "goal":"gate order", "risk":"writes", "phases":phases
+            }))
+            .expect("plan");
+            spec.gates = gates.clone();
+            assert_eq!(validate_gate_phase_order(&spec).is_err(), backward);
+        }
+        let mut spec = structured_plan_to_workflow_spec(&json!({
+            "goal":"parallel gate order",
+            "children":[{"prompt":"verify", "role":"verify"}]
+        }))
+        .expect("parallel plan");
+        spec.gates = gates;
+        spec.nodes = vec![serde_json::from_value(json!({
+            "kind":"branch_set", "spec":{
+                "id":"concurrent", "parallel":true,
+                "children":[
+                    {"kind":"leaf", "spec":{"id":"verify", "prompt":"verify", "role":"verify"}},
+                    {"kind":"sequence", "spec":{"id":"prepare", "children":[
+                        {"kind":"leaf", "spec":{"id":"scout", "prompt":"scout", "role":"scout"}},
+                        {"kind":"leaf", "spec":{"id":"implement", "prompt":"implement", "role":"implement"}}
+                    ]}}
+                ]
+            }
+        })).expect("parallel branch")];
+        validate_gate_phase_order(&spec).expect("concurrent branches have no total role order");
+    }
+
     #[tokio::test]
     async fn native_default_shared_budget_applies_only_without_an_explicit_budget() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -13405,17 +13595,16 @@ FINAL RECEIPT
             },
         );
         for (explicit, expected) in [(None, 123), (Some(17), 17), (Some(246), 246)] {
-            let mut input = json!({"action":"run", "script":"return budget.remaining();"});
+            let mut input = json!({"action":"run", "script":"return { total: budget.total, remaining: budget.remaining(), metered: budget.metered };"});
             if let Some(explicit) = explicit {
                 input["token_budget"] = json!(explicit);
             }
             let receipt = tool.execute(input, &context).await.expect("budget run");
             let receipt: Value = serde_json::from_str(&receipt.content).expect("budget receipt");
             assert_eq!(receipt["token_budget"], expected);
-            assert_eq!(
-                receipt["result"], expected,
-                "the same effective cap reaches the VM"
-            );
+            assert_eq!(receipt["result"]["total"], expected);
+            assert!(receipt["result"]["remaining"].is_null());
+            assert_eq!(receipt["result"]["metered"], false);
         }
     }
 
@@ -13552,6 +13741,36 @@ FINAL RECEIPT
         );
     }
 
+    fn fake_chat_response(stream: bool, id: String, text: &str) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let usage = json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2});
+        if stream {
+            let content = json!({
+                "id": id,
+                "model": "deepseek-v4-flash",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": null}],
+            });
+            let terminal = json!({
+                "id": id,
+                "model": "deepseek-v4-flash",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": usage,
+            });
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                format!("data: {content}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
+            )
+                .into_response()
+        } else {
+            Json(json!({
+                "id": id,
+                "model": "deepseek-v4-flash",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                "usage": usage,
+            })).into_response()
+        }
+    }
+
     fn stub_client() -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = crate::config::Config {
@@ -13561,27 +13780,39 @@ FINAL RECEIPT
         CodewhaleClient::new(&config).expect("stub client should construct")
     }
 
-    async fn fake_chat_client(response_text: &str) -> (CodewhaleClient, Arc<AtomicUsize>) {
-        let (client, calls, _) = fake_chat_client_capturing(response_text).await;
-        (client, calls)
+    async fn fake_chat_client(
+        response_text: &str,
+    ) -> (CodewhaleClient, Arc<AtomicUsize>, crate::config::Config) {
+        let (client, calls, _, config) = fake_chat_client_capturing(response_text).await;
+        (client, calls, config)
     }
 
     async fn fake_chat_client_responses(
         response_texts: &[&str],
-    ) -> (CodewhaleClient, Arc<AtomicUsize>) {
-        let (client, calls, _) = fake_chat_client_capturing_responses(response_texts).await;
-        (client, calls)
+    ) -> (CodewhaleClient, Arc<AtomicUsize>, crate::config::Config) {
+        let (client, calls, _, config) = fake_chat_client_capturing_responses(response_texts).await;
+        (client, calls, config)
     }
 
     pub(super) async fn fake_chat_client_capturing(
         response_text: &str,
-    ) -> (CodewhaleClient, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+    ) -> (
+        CodewhaleClient,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<Value>>>,
+        crate::config::Config,
+    ) {
         fake_chat_client_capturing_responses(&[response_text]).await
     }
 
     async fn fake_chat_client_capturing_responses(
         response_texts: &[&str],
-    ) -> (CodewhaleClient, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+    ) -> (
+        CodewhaleClient,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<Value>>>,
+        crate::config::Config,
+    ) {
         assert!(
             !response_texts.is_empty(),
             "fake chat client needs at least one response"
@@ -13605,6 +13836,7 @@ FINAL RECEIPT
                     let bodies = Arc::clone(&bodies);
                     let response_texts = Arc::clone(&response_texts);
                     async move {
+                        let stream = body["stream"].as_bool().unwrap_or(false);
                         bodies.lock().expect("capture body").push(body);
                         let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
                         let response_text = if response_texts.len() == 1 {
@@ -13620,23 +13852,11 @@ FINAL RECEIPT
                                 })
                                 .clone()
                         };
-                        Json(json!({
-                            "id": format!("chatcmpl-workflow-test-{attempt}"),
-                            "model": "deepseek-v4-flash",
-                            "choices": [{
-                                "index": 0,
-                                "message": {
-                                    "role": "assistant",
-                                    "content": response_text
-                                },
-                                "finish_reason": "stop"
-                            }],
-                            "usage": {
-                                "prompt_tokens": 1,
-                                "completion_tokens": 1,
-                                "total_tokens": 2
-                            }
-                        }))
+                        fake_chat_response(
+                            stream,
+                            format!("chatcmpl-workflow-test-{attempt}"),
+                            &response_text,
+                        )
                     }
                 }
             }),
@@ -13661,6 +13881,7 @@ FINAL RECEIPT
             CodewhaleClient::new(&config).expect("fake chat client"),
             calls,
             bodies,
+            config,
         )
     }
 

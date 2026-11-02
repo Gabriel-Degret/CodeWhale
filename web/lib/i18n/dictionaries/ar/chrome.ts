@@ -20,6 +20,7 @@ export const chrome: ChromeDict = {
   navCommunity: "المجتمع",
   navContribute: "المساهمة",
 
+  navFeatures: "القدرات",
   navProduct: "المنتج",
   navModels: "النماذج",
   navPlugins: "الإضافات",
@@ -30,8 +31,6 @@ export const chrome: ChromeDict = {
   navHomeAria: "الصفحة الرئيسية لـ Codewhale",
 
   installCta: "ثبّت ←",
-
-  authSignIn: "تسجيل الدخول",
 
   dateLocale: "ar",
 
@@ -45,7 +44,7 @@ export const chrome: ChromeDict = {
   themeTitle: "السمة · تلقائي / فاتح / داكن",
 
   footerTagline:
-    "اصنع ما تريد وأتمت العمل اليومي باستخدام النماذج التي تختارها.",
+    "وكيل البرمجة مفتوح المصدر لطرفيتك والنماذج التي تختارها.",
   footerProduct: "المنتج",
   footerProject: "المشروع",
   footerDocs: "التوثيق",

@@ -12,6 +12,7 @@ export const chrome: ChromeDict = {
   navCommunity: "Community",
   navContribute: "Contribute",
 
+  navFeatures: "Capabilities",
   navProduct: "Product",
   navModels: "Models",
   navPlugins: "Plugins",
@@ -22,8 +23,6 @@ export const chrome: ChromeDict = {
   navHomeAria: "Codewhale home",
 
   installCta: "Install →",
-
-  authSignIn: "Sign in",
 
   dateLocale: "en-US",
 
@@ -37,7 +36,7 @@ export const chrome: ChromeDict = {
   themeTitle: "Theme · auto / light / dark",
 
   footerTagline:
-    "Create what you want and automate everyday work with the models you choose.",
+    "The open-source coding agent for your terminal and the models you choose.",
   footerProduct: "Product",
   footerProject: "Project",
   footerDocs: "Docs",

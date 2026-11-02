@@ -75,6 +75,9 @@ pub struct TurnStopDiagnostics {
     /// Parent streaming ModelClient calls, including stream retries. Excludes
     /// HTTP retries inside the client, compaction and child calls; not invoices.
     pub model_requests_started: u32,
+    /// HTTP retries actually entered inside the captured parent request.
+    /// This is dispatch evidence, not provider usage or a bill.
+    pub transport_retries: u32,
     pub transparent_stream_retries: u32,
     pub stream_resumes: u32,
     pub reasoning_only_reprompts: u32,
@@ -82,7 +85,6 @@ pub struct TurnStopDiagnostics {
     /// reasoning and no tool call (#6310): an exact-prefix retry, then a
     /// nudged one, before the turn fails visibly.
     pub empty_stop_retries: u32,
-    pub soft_landing_sent: bool,
     pub final_report_requested: bool,
     pub permission_strategy_switches: u32,
     /// Denied provider-response batches since the latest useful progress.
@@ -447,12 +449,12 @@ impl ToolInspectionSnapshot {
     #[must_use]
     #[cfg(test)]
     pub fn render_text(&self) -> String {
-        crate::diagnostics_reports::render_tool_snapshot_text(&project_snapshot(self))
+        codewhale_commands::diagnostics_reports::render_tool_snapshot_text(&project_snapshot(self))
     }
 
     #[cfg(test)]
     pub fn render_json(&self) -> Result<String, serde_json::Error> {
-        crate::diagnostics_reports::render_tool_snapshot_json(&project_snapshot(self))
+        codewhale_commands::diagnostics_reports::render_tool_snapshot_json(&project_snapshot(self))
     }
 }
 

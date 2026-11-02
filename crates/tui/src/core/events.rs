@@ -8,7 +8,7 @@ use std::{path::PathBuf, sync::Arc};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::error_taxonomy::ErrorEnvelope;
 use crate::tools::goal::GoalSnapshot;
 use crate::tools::spec::{ToolError, ToolResult};
@@ -41,9 +41,9 @@ pub enum TurnOutcomeStatus {
 /// turns such as composer `!` shell commands use no route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnRoute {
-    pub provider: ApiProvider,
+    pub provider: ProviderKind,
     /// Exact non-secret configured route key. Named custom providers all map
-    /// to [`ApiProvider::Custom`], so the enum alone is not provenance.
+    /// to [`ProviderKind::Custom`], so the enum alone is not provenance.
     pub provider_identity: String,
     pub model: String,
     pub auto_model: bool,
@@ -184,12 +184,6 @@ impl AgentProgressEventMeta {
     }
 
     #[must_use]
-    pub const fn routine_wait(mut self) -> Self {
-        self.routine_wait = true;
-        self
-    }
-
-    #[must_use]
     pub fn with_tool(mut self, tool_name: impl Into<String>) -> Self {
         self.tool_name = Some(tool_name.into());
         self
@@ -214,30 +208,57 @@ pub enum Event {
         omitted_tool_count: usize,
     },
 
+    RequestImageWindow {
+        provider: String,
+        model: String,
+        total: usize,
+        elided: usize,
+        cap: usize,
+        cap_source: String,
+        message: String,
+    },
+
     /// Workspace snapshots (undo) could not be enabled for this workspace.
     /// Emitted once per session/workspace so another session cannot consume
     /// its notice. The disabled state also remains visible in `/status` (#5930).
     /// `reason` is the single localized line rendered from the gate, so every
     /// surface states the workspace, the limit, and the recovery exactly once.
-    SnapshotsDisabled { workspace: String, reason: String },
+    SnapshotsDisabled {
+        workspace: String,
+        reason: String,
+    },
     // === Streaming Events ===
     /// A new message block has started
-    MessageStarted { index: usize },
+    MessageStarted {
+        index: usize,
+    },
 
     /// Incremental text content delta
-    MessageDelta { index: usize, content: String },
+    MessageDelta {
+        index: usize,
+        content: String,
+    },
 
     /// Message block completed
-    MessageComplete { index: usize },
+    MessageComplete {
+        index: usize,
+    },
 
     /// Thinking block started
-    ThinkingStarted { index: usize },
+    ThinkingStarted {
+        index: usize,
+    },
 
     /// Incremental thinking content delta
-    ThinkingDelta { index: usize, content: String },
+    ThinkingDelta {
+        index: usize,
+        content: String,
+    },
 
     /// Thinking block completed
-    ThinkingComplete { index: usize },
+    ThinkingComplete {
+        index: usize,
+    },
 
     // === Tool Events ===
     /// Tool call initiated
@@ -255,6 +276,16 @@ pub enum Event {
     /// deliberately long-running tool turn stale.
     ToolCallHeartbeat,
 
+    /// Optional actual dispatch observation for a narrowed protocol host.
+    ToolExecutionStarted {
+        id: String,
+    },
+    /// Canonical rich result after existing output/media preservation.
+    ToolResultContent {
+        id: String,
+        blocks: Vec<codewhale_tools::ToolResultContentBlock>,
+    },
+
     /// Tool call completed
     ToolCallComplete {
         id: String,
@@ -265,15 +296,17 @@ pub enum Event {
 
     /// Trusted operation activity emitted only after dispatch and authority
     /// gates resolve the underlying operation. The payload deliberately
-    /// excludes tool names, arguments, commands, and results.
+    /// excludes arguments, commands, and results.
     OperationActivityStarted {
         span_id: String,
         activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind,
+        action_id: Option<String>,
     },
     OperationActivityCompleted {
         span_id: String,
         activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind,
         outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome,
+        action_id: Option<String>,
     },
 
     // === Turn Lifecycle ===
@@ -316,10 +349,24 @@ pub enum Event {
     /// Immutable billing route captured at CodeWhale's pre-permit application
     /// dispatch boundary, after request preparation. This is admission-time
     /// evidence, not proof of network delivery or provider invoice-time rates.
-    RouteDispatched { turn_id: String, route: TurnRoute },
+    RouteDispatched {
+        turn_id: String,
+        route: TurnRoute,
+    },
 
     /// The turn is complete (no more tool calls)
     TurnComplete {
+        /// Actual started turn, captured by its producer; absent on preflight
+        /// rejection.
+        turn_id: Option<String>,
+        /// Original host submission, also echoed when it fails before
+        /// `TurnStarted`. Runtime self-starts and non-message operations never
+        /// borrow a pending host id.
+        submission_id: Option<String>,
+        /// Manual compaction operation id. Mutually exclusive with the two
+        /// fields above; auto compaction closes its enclosing model turn
+        /// instead.
+        compaction_id: Option<String>,
         /// Total usage for session/goal/token metrics, including programmatic
         /// child calls performed inline during this turn.
         usage: Usage,
@@ -336,6 +383,10 @@ pub enum Event {
         tool_catalog: Option<Vec<Tool>>,
         /// API base URL used by this turn's client.
         base_url: Option<String>,
+    },
+
+    ProviderRequestReceipt {
+        receipt: serde_json::Value,
     },
 
     /// A single model call (turn-step) within the turn completed and the
@@ -363,6 +414,7 @@ pub enum Event {
         /// measured (for example an aggregate REPL child receipt). This is
         /// the denominator for effective session-average throughput.
         request_ms: Option<u64>,
+        finish_reason: Option<String>,
     },
 
     /// Usage telemetry for a programmatic provider call whose cost is carried
@@ -378,17 +430,23 @@ pub enum Event {
 
     /// Runtime goal state changed inside the engine, usually from model-visible
     /// `create_goal` or `update_goal` tool calls.
-    GoalUpdated { snapshot: GoalSnapshot },
+    GoalUpdated {
+        snapshot: GoalSnapshot,
+    },
 
     /// The interactive engine is in the configured quiet period before one
     /// already-authorized goal continuation. This is lifecycle state, not a
     /// status string: Esc/Ctrl+C can cancel it without pretending a provider
     /// turn is still in flight.
-    GoalContinuationWaiting { delay_seconds: u64 },
+    GoalContinuationWaiting {
+        delay_seconds: u64,
+    },
 
     /// The between-turn quiet period ended. `interrupted` distinguishes a
     /// user/external cancel from normal expiry or a goal status control.
-    GoalContinuationWaitEnded { interrupted: bool },
+    GoalContinuationWaitEnded {
+        interrupted: bool,
+    },
 
     /// Context compaction started.
     CompactionStarted {
@@ -449,7 +507,9 @@ pub enum Event {
     },
 
     /// Context purge failed.
-    PurgeFailed { message: String },
+    PurgeFailed {
+        message: String,
+    },
 
     /// Context compaction failed.
     CompactionFailed {
@@ -568,7 +628,9 @@ pub enum Event {
     },
 
     /// Status message for UI display
-    Status { message: String },
+    Status {
+        message: String,
+    },
 
     /// Session-owned MCP + plugin boot progress.
     ///
@@ -594,7 +656,9 @@ pub enum Event {
     /// prompt; it never carries runtime/system additions. There is no error
     /// variant: a manifest that cannot describe something says so in a typed
     /// unavailable section instead.
-    RequestManifestReady { rendered: String },
+    RequestManifestReady {
+        rendered: String,
+    },
 
     /// Pause terminal input events (for interactive subprocesses).
     PauseEvents {
@@ -626,6 +690,12 @@ pub enum Event {
         /// When true, the UI must show the prompt instead of consuming
         /// session/auto approval shortcuts.
         approval_force_prompt: bool,
+    },
+
+    /// The engine no longer waits for this approval. Every decision surface
+    /// must retire the request by identity without sending a user decision.
+    ApprovalWithdrawn {
+        id: String,
     },
 
     /// Request user input for a tool call
@@ -770,7 +840,7 @@ pub fn bounded_tool_projection_warning_names(omitted_tool_names: &[String]) -> V
         .map(|name| {
             let cleaned: String = name
                 .chars()
-                .filter(|c| !c.is_control() && !is_bidi_format_control(*c))
+                .filter(|c| !c.is_control() && !codewhale_sanitize::sanitize::is_bidi_control(*c))
                 .collect();
             let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
             let collapsed = if collapsed.is_empty() {
@@ -873,11 +943,23 @@ impl StatusVisibility {
     }
 }
 
-/// Classify an engine status line for durable clients.
-///
-/// Matches the engine's own fixed status wording (turn scheduler, step
-/// continuation, deferred-tool hydration). Unknown lines stay user-visible,
-/// so a new status is never silently hidden.
+/// Engine-owned retry status wording. Retain these observations in the TUI
+/// transcript without turning unrelated scheduler/footer updates into rows.
+#[must_use]
+pub fn is_retry_status_receipt(message: &str) -> bool {
+    [
+        "Retry attempt: ",
+        "Retry recovery: ",
+        "Retry exhaustion: ",
+        "Retry interrupted: ",
+        "Retry stopped: ",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix))
+}
+
+/// Classify an engine status line for durable clients. Unknown lines stay
+/// user-visible; internal scheduler and model-only notices retain their scope.
 #[must_use]
 pub fn status_visibility(message: &str) -> StatusVisibility {
     let message = message.trim();
@@ -983,7 +1065,7 @@ pub fn bounded_gate_reason(reason: &str) -> String {
     const MAX_CHARS: usize = 220;
     let cleaned: String = reason
         .chars()
-        .filter(|c| !c.is_control() && !is_bidi_format_control(*c))
+        .filter(|c| !c.is_control() && !codewhale_sanitize::sanitize::is_bidi_control(*c))
         .collect();
     let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= MAX_CHARS {
@@ -992,13 +1074,6 @@ pub fn bounded_gate_reason(reason: &str) -> String {
     let mut out: String = collapsed.chars().take(MAX_CHARS - 1).collect();
     out.push('…');
     out
-}
-
-pub(crate) fn is_bidi_format_control(c: char) -> bool {
-    matches!(
-        c,
-        '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
-    )
 }
 
 #[cfg(test)]
@@ -1074,6 +1149,28 @@ mod status_visibility_tests {
             assert_eq!(status_visibility(user), StatusVisibility::User, "{user}");
         }
         assert_eq!(StatusVisibility::Internal.as_str(), "internal");
+    }
+
+    #[test]
+    fn retry_status_receipts_classify_every_closing_kind_without_footer_noise() {
+        for message in [
+            "Retry attempt: transport 1/2; upstream 503; waiting 0.00s",
+            "Retry recovery: stream recovered after 1 retries",
+            "Retry exhaustion: stream stopped after 2 retries",
+            "Retry interrupted: request cancelled",
+            "Retry stopped: transparent stream completion was not observed",
+        ] {
+            assert!(super::is_retry_status_receipt(message), "{message}");
+            assert_eq!(status_visibility(message), StatusVisibility::User);
+        }
+        for message in [
+            "Executing tools sequentially",
+            "Loaded deferred tool 'load_skill'. Retry the call with its visible schema.",
+            "Goal set; starting goal work.",
+            "Retry stopped",
+        ] {
+            assert!(!super::is_retry_status_receipt(message), "{message}");
+        }
     }
 
     #[test]

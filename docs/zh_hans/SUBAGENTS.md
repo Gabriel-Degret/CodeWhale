@@ -1,17 +1,17 @@
 # Fleet 与子智能体
 
 > 英文原文：[SUBAGENTS.md](../SUBAGENTS.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> 最后与英文同步日期（last synced with English revision）：2026-10-02。
 
 Fleet 管理这些子智能体所用的已保存模型和角色分配。单项委派使用 `agent`；带有阶段、依赖和完成检查的工作使用 `workflow`。使用 Fleet 模型候选列表的计划，参见 [Workflow 编写指南](WORKFLOW_AUTHORING.md)。
 
 Fleet 角色是委派工作面向用户的词汇：父智能体通过 `agent` 启动一个专注的 `general`、`explore`、`planner`、`reviewer`、`implement`、`test` 或 `advisor`，`worker` 运行期间会拿回 `agent_id`、声明的交付文件和有效限制。默认回执是紧凑的；需要转录句柄或账本时，再按 ID 请求详情。内部运行时类型是 `FleetRole`（以前叫 `SubAgentType`）；旧的角色拼写（`worker`、`scout`、`plan`、`review`、`builder`、`verifier`、`consultant`、`oracle` 等）在 v0.9.x 期间仅作为持久化/反序列化的兼容适配层继续被接受。新的提示词和配置应使用 Fleet 的规范名称。
 
-从架构上讲，子智能体不应成为第二套执行基质。持久化的原语是 [`AGENT_RUNTIME.md`](AGENT_RUNTIME.md) 中描述的、由 Fleet 支撑的 `worker` 运行：重试、终态、回执、工件引用、检查和重启行为都归属那里。面向模型的启动器是单一的 `agent` 工具，detached 工作应当收敛到与 Agent Fleet 相同的生命周期。
+子任务与普通回合使用同一个 `Engine::run_turn` 规划器、执行器、Session 和审批收件箱。私有的已捕获 ChildGrant 在最终执行边界收窄工具动作、shell、工作区、网络和后代深度。原有 SubAgentManager 继续管理启动名额、协调、worker 检查点和终态交付，不再运行另一个模型/工具循环。工作回合与唯一的有界汇报回合共享这个已配置的子 Engine 和原始截止时间。
 
-在这次切换完成之前，当前的 `agent` 实现委托给持久化的子智能体运行时。它对会话内的短期委派仍然有用。来自提供商的瞬态 header/stream/超时失败，会先在子运行时内部以退避方式重试，之后才把 `worker` 标记为 interrupted；如果重试预算耗尽，Codewhale 会保留一个检查点并返回延续句柄，而不是让父智能体去推断发生了什么。对于必须经受进程重启、休眠或远程执行的工作，优先使用 Fleet，或由 Workflow 支撑的 Fleet 运行。
+提供商瞬态失败使用 Core 的分发与重试边界。预算耗尽或请求中断会保留已记录的检查点及延续句柄。每次实际分发的请求都携带原始会话、路由和来源标识：提供商用量只计费一次，然后投影到 worker 账本。成功但没有用量的响应与结果未知的请求分别保留覆盖缺口，均不会被标为零成本。需要经受进程重启、休眠或远程执行的工作请使用 Fleet 或由 Workflow 支撑的运行。
 
-子智能体继承父智能体被允许使用的工具注册表，包括 `agent` 协调。生成遵守同一个绝对深度上限：根为深度 0，它的子智能体为深度 1，处于 `max_spawn_depth` 的子智能体不能再生成。操作者默认值为 3，硬上限为 8。角色、已保存的 profile 或兼容请求只能收窄这个上限。恢复和转录分叉会保留来源的位置和限制，不会多换来一代。已移除的 `agent_open`/`agent_eval`/`agent_close` 生命周期工具不会出现在任何注册表中。
+子智能体继承父智能体被允许使用的工具注册表，包括 `agent` 协调。生成遵守同一个绝对深度上限：根为深度 0，它的子智能体为深度 1，处于 `max_spawn_depth` 的子智能体不能再生成。默认不设置产品深度上限。操作者、角色及已保存的 profile 仍可收窄后代权限；模型请求不能自行选择上限。恢复和转录分叉会保留来源的位置和限制，不会多换来一代。已移除的 `agent_open`/`agent_eval`/`agent_close` 生命周期工具不会出现在任何注册表中。
 
 健康的子智能体在父智能体的一次普通响应结束后会继续运行。它们的完成通知经由现有的 Engine 收件箱返回，并可唤醒父智能体开始另一个正常回合。显式中断或取消仍然具有最终效力。`detached: true` 另外让一棵子树不受父回合取消的影响；它不会移除子智能体的预算，也不会移除无界面主机的截止时间。
 
@@ -44,7 +44,7 @@ Fleet 角色是委派工作面向用户的词汇：父智能体通过 `agent` �
 
 在进程内部，解析后的权限是一个对象——`crates/tui/src/worker_profile.rs` 中的 `ChildGrant`：`files`（none/read/write）、`shell`（none/inspect/verify/full）、`network`、`desktop`（绝不授予子智能体）、具名工具 `surface`、调用方的显式 `scope`，以及剩余的 `spawn` 深度。角色是这个对象上的一组预设（`ChildGrant::for_role`）；`ChildGrant::resolve` 把它与由父智能体派生的 profile 取交集。子智能体的工具目录、分发时的拒绝和能力包络读取的是同一组字段——可见的工具就可以调用，被拒绝的工具永远不会出现。
 
-会话的**权限姿态**在每个子智能体内部的适用方式，与它在父回合上完全一致：在 Auto-Review 下，同一个确定性底线和一次性的模型守护者来裁决 `worker` 被扣留的调用（从不弹提示；守护者不可用时拒绝，即 fail closed）；在 Ask 下，角色无法代为决定的被扣留调用，会作为审批提示出现在父智能体的 UI 中，`worker` 显式地等待（`waiting for user`），在无法弹提示的主机上则带着原因被拒绝；Full Access 在不可绕过的安全底线上仍然 fail closed。每一次无人被提示的裁决，都是该 `worker` 转录中的一行备注（聚焦它时可见）和一条审计日志记录。参见 `docs/MODES.md`。
+会话的**权限姿态**在每个子智能体内部的适用方式，与它在父回合上完全一致：在 Auto-Review 下，同一个确定性底线和一次性的模型守护者来裁决 `worker` 被扣留的调用（从不弹提示；守护者不可用时拒绝，即 fail closed）；在 Ask 下，角色无法代为决定的被扣留调用，会作为审批提示出现在父智能体的 UI 中，`worker` 显式地等待（`waiting for user`），在无法弹提示的主机上则带着原因被拒绝；Full Access 与父回合完全一致地生效，用户已授予的调用不会再被 Auto-Review 底线拦下。每一次无人被提示的裁决，都是该 `worker` 转录中的一行备注（聚焦它时可见）和一条审计日志记录。参见 `docs/MODES.md`。
 
 每个角色完整的系统提示词位于 `crates/tui/src/tools/subagent/mod.rs`（搜索 `*_AGENT_INTRO`）。提示词前缀在子智能体启动时自动加载；父智能体的委派提示词成为第一个回合的用户消息。
 
@@ -56,7 +56,7 @@ Fleet 角色是委派工作面向用户的词汇：父智能体通过 `agent` �
 
 分叉状态显示的是父智能体的 To-do 快照——由 `todo_write` 写入的唯一的 Work 界面。子智能体的 `<codewhale:fork_state>` 块携带 `crates/tui/src/todo_snapshot.rs` 渲染的有界正文，因此分叉是从父智能体真实的进度位置继续，而不是从一段转述继续。这一 To-do 部分在生成发生时解析，所以同一个父回合中更早的 `todo_write` 也会被包含进来。
 
-**该列表只在生成的那一刻显示一次，之后绝不会重新发送。** 没有哪个子智能体请求会重新陈述 To-do 列表，父智能体的请求也不会。每个智能体都保留自己的私有列表（#4810）；它对这个列表的了解，来自它自己的 `todo_write` 调用返回的工具结果，而这些结果是它自己转录中的普通消息。因此 `worker` 无法读取或写入父智能体或兄弟智能体的列表，被分叉出的子智能体也无法修改交给它的快照，或持续读取父智能体之后的变化。
+**该列表只在生成的那一刻显示一次，之后绝不会重新发送。** 没有哪个子智能体请求会重新陈述 To-do 列表，父智能体的请求也不会。每个智能体都保留自己的私有列表（#4810）；它对这个列表的了解，来自它自己的 `todo_write` 调用（每次调用都发送完整列表）以及这些调用返回的简短回执，而这些都是它自己转录中的普通消息。因此 `worker` 无法读取或写入父智能体或兄弟智能体的列表，被分叉出的子智能体也无法修改交给它的快照，或持续读取父智能体之后的变化。
 
 子智能体转录内卡片显示的正是这份私有列表。一张委派卡片渲染的是**它自己**那个智能体 To-do 的有界投影——已完成/总数计数、始终包含进行中的条目、最多三行，以及当界限省略其余部分时显式的 `… +N more`——由 `card_todo_projection` 用与面向模型的正文相同的快照、优先级顺序和清洗器构建。卡片只会消费 `agent_id` 与自己匹配的信封，因此父智能体的列表绝不会出现在子智能体名下，也没有兄弟智能体的列表会出现在另一个名下。没有陈述任何工作的智能体完全不显示 To-do 行，而不是显示占位任务；终态卡片保留它的智能体实际发布的最后一份快照。扇出（fanout）卡片保持为圆点网格，不显示子智能体的 To-do：一张卡片背后有许多 `worker` 时，没有一个能如实挂载单一列表的位置。只有当运行时已经把该子智能体表示为它自己的委派卡片时，才会出现子智能体的 To-do。
 
@@ -128,7 +128,7 @@ Scout、reviewer 和 planner 智能体、被 `write_authority: "read_only"` 收�
 }
 ```
 
-这一模式要求原生的文件系统只读隔离，并且拒绝网络访问。它只接受前台的 `run`，以及 `command`、可选的 `cwd` 和 `timeout_ms`。后台或交互模式、stdin、沙箱升级以及外部执行后端都与它不兼容。如果原生强制隔离不存在或无法准备，调用会在执行命令之前拒绝；这个标志绝不会退回去相信一句“代码只读不写”的承诺。现有的角色、工具和祖先策略限制依然适用。
+这一模式要求原生的文件系统只读隔离。出站网络跟随调用方自己的 shell：只有当会话处于 Full Access（完全访问）、其沙箱允许网络、其 `[network]` 策略的默认值不是拒绝（deny），并且该智能体保有网络授权时才会开启；在 Ask（询问）或 Auto-Review（自动审核）下，联网命令需要一次本模式从不发起的审批，所以它保持离线。网络开启时，`curl` 和 HTTPS 客户端可以正常工作。`read_only` 只阻止本地文件写入，不阻止会改变远程服务的请求。此时在 macOS 上，该模式可以通过 IPv4 访问主机、系统 DNS 解析器，以及 `HTTP_PROXY`、`HTTPS_PROXY` 或 `ALL_PROXY` 指定的本地代理服务器，但不能使用 IPv6，也不能访问本机自己地址上的其他端口或本地套接字；在 Linux 上，它与联网的 workspace-write shell 一样共享主机网络命名空间，包括回环地址和抽象 unix 套接字。联网运行会在工具结果元数据中记录 `sandbox_network: true`。它只接受前台的 `run`，以及 `command`、可选的 `cwd` 和 `timeout_ms`。后台或交互模式、stdin、沙箱升级以及外部执行后端都与它不兼容。如果原生强制隔离不存在或无法准备，调用会在执行命令之前拒绝；这个标志绝不会退回去相信一句“代码只读不写”的承诺。现有的角色、工具和祖先策略限制依然适用。
 
 对于自己作用域之外的写入拒绝，`agent(action="claim", ...)` 可以把被允许的路径加入你的声明，但它不能夺走仍然存活的同级智能体的声明。请等待该同级智能体，选择互不相交的有界写入，或对需要写入的代码使用单独的 worktree。`action="release"` 只会清除所有者已不再存活的声明；它不是用来解锁另一个正在运行的 `worker` 的文件的手段。
 
@@ -147,7 +147,7 @@ STOP_CONDITION:
 OUTPUT: VERDICT, EVIDENCE, GAPS, NEXT
 ```
 
-`scout` 简报默认为快速的只读调查（不写入，但网络触达和有界验证界面可用于真正的侦察）。一次快速侦察通常只需要寥寥几次调用：定位、搜索、读取决定性的那几行，然后返回——但要在拿到决定性证据时停下，而不是在达到某个数字时停下。这里没有需要节省的“每个智能体调用上限”；运行时限制的是深度和并发，而不是好奇心。除非证据与之矛盾，否则不要重复 `ALREADY_KNOWN` 中的工作。Builder 和修复类简报应当在扩大范围之前，或在反复失败之后设置检查点。
+`scout` 简报要求只读调查，并收集足够的证据可靠地回答问题。调查深度由任务本身决定。除非证据与之矛盾，否则不要重复 `ALREADY_KNOWN` 中的工作。Builder 和修复类简报应在扩大范围前或反复失败后保存检查点，调整方法并继续完成其余已授权工作。
 
 好的委派提示词示例：
 
@@ -171,7 +171,7 @@ OUTPUT: VERDICT, EVIDENCE, GAPS, NEXT.
 
 ```text
 QUESTION: Is the focused prompt/subagent test filter valid, and what fails if not?
-SCOPE: cargo test -p codewhale-tui --bin codewhale-tui --locked prompt; subagent filter if needed.
+SCOPE: cargo test -p codewhale-tui --lib --locked prompt; subagent filter if needed.
 ALREADY_KNOWN: Do not fix failures; capture exact command, exit code, and first relevant assertion.
 EFFORT: medium
 STOP_CONDITION: Stop after one clean PASS or one reproducible failing assertion with command evidence.
@@ -235,13 +235,13 @@ OUTPUT: VERDICT, EVIDENCE, GAPS, NEXT.
 max_concurrent = 20
 launch_concurrency = 20
 max_admitted = 200
-# Operator-selected Runtime delegation depth. The default is 3; this explicit
-# value opts in above the default but remains below the hard ceiling of 8.
+# Operator-selected Runtime delegation depth. Omit to leave it uncapped.
+# This explicit value restricts descendants to six levels.
 max_depth = 6
 # Omitted or zero model-step budget is unbounded. Set a positive value only
 # when an operator deliberately wants a per-child cap.
 default_max_steps = 0
-default_wall_time_secs = 1800
+default_wall_time_secs = 0
 
 [subagents.providers.deepseek]
 # Direct API key with room to fan out.
@@ -279,7 +279,6 @@ max_admitted = 12
 | --- | --- |
 | 启动与路由 | `action`、`prompt`、`type`、`profile`、`name`、`model`、`model_strength`、`thinking` |
 | 作用域与产出 | `worktree`、`cwd`、`write_authority`、`write_roots`、`exact_files`、`coordination_contracts`、`deliverables`、`expected_artifact` |
-| 收窄运行限制 | `max_steps`、`wall_time_secs` |
 | 协调与恢复 | `agent_id`、`agent_ids`、`all_parked`、`message`、`until`、`detached`、`resume_from` |
 | 检查 | `detail`、`offset`、`limit` |
 
@@ -293,46 +292,60 @@ max_admitted = 12
 
 **可解析但不公布（兼容）。** 其他输入仍被接受，用于已保存的转录、ACP/MCP 客户端、Fleet 执行数据，以及内部/操作者的兼容。运行时会校验它们，并与实时策略取交集：
 
-- 委派兼容：`max_depth`、`maxDepth` 或 `max_spawn_depth`；取值限制在 0 到 Runtime 硬上限 8 之间，并且只会收窄继承来的绝对上限。面向模型的调用从操作者和所选 profile 继承深度。
+- 委派兼容：`max_depth`、`maxDepth` 或 `max_spawn_depth`；面向模型的调用会忽略这些值，从操作者和所选 profile 继承深度。确切的 Fleet 权限仍使用经过验证的深度上限。
 - 工作区/隔离：`workspace_policy`、`fork_context`、`worktree_path`、`worktree_branch`、`worktree_base`
 - 生成契约：`deliberate`、`dependencies`、`acceptance`、`allowed_tools`
 - 生命周期附加项：`timeout_secs`（wait）、`reason`（interrupt）、`include_archived`（status）
 
 兼容输入不是用来放宽继承来的权限，或去掉有限预算的途径。
 
-## 子智能体预算（步数、墙钟时间、token）
+## 子智能体限制与完成
 
-`max_steps` 和 `wall_time_secs` 是可选的逐次调用限制。它们各自只能收窄适用的角色、操作者、父智能体和已保存运行的限制；唯一的例外是 `wall_time_secs` 可以抬高内置的 1800 秒默认值（见下文）。省略即继承这些限制；显式的零、null、负值或越界值会被工具解析器拒绝（schema 最小值为 1）。Fleet 文件任务规格使用不同的约定——那里省略或为零表示无界；参见 `docs/FLEET.md`。
+子智能体默认没有模型回合或墙钟时间上限。它们持续工作，直到任务完成、需要用户
+输入、被取消，或达到所有者明确设置的限制。耗时和步骤数量不能证明工作已经完成。
+运行时不会根据预算百分比注入“停止探索”或“提前收尾”的指令。
 
-`max_steps` 统计模型回合，接受 1 到 2000。所有角色默认没有模型回合上限，除非操作者或祖先提供了一个；该默认值内部用零来表示，它绝不会取消一个有限的继承上限。`wall_time_secs` 接受 1 到 86400。省略时默认为 1800 秒。为了长时间无人值守的工作，显式值可以高于这个内置默认值；操作者配置的 `default_wall_time_secs` 既是默认值，也是上限，而角色、父智能体和已保存运行的截止时间仍然只会收窄。它同时覆盖模型请求和工具。有效的绝对截止时间会被持久化，并在排队的智能体启动时再次保存，因此之后的续跑受该智能体实际遵循的截止时间约束。
+面向模型的 `agent` 工具不再公布 `max_steps`、`wall_time_secs` 或
+`max_output_tokens`。有效的旧参数仍可解析，但不会限制模型启动的子智能体。
+启动回执中的 `ignored_limit_fields` 列出被忽略的参数，`effective_limits`
+显示实际生效的限制。模型应说明任务、写入范围、交付物和验收标准，不应猜测完成
+任务需要多少回合或分钟。
 
-工作时钟从智能体拿到启动槽位时开始。在启动队列里等待的智能体最多等待 `wall_time_secs`；如果这段时间内没有槽位空出来，它会以 `never started` 的原因和零步失败，而不是被报告为用尽了预算的运行。等待之后确实拿到槽位的智能体，从那一刻起获得完整的 `wall_time_secs`，仍受任何父智能体、已保存运行或来源截止时间的约束。因此，父智能体对一个排队的智能体最多可能要等大约两倍的 `wall_time_secs`。排队的那一行会写明等待的原因以及智能体停止等待的时间。如果智能体经常等很久，请一次少启动几个。
+操作者可在 `[subagents]` 中明确设置 `default_max_steps` 或
+`default_wall_time_secs`。省略或零表示无上限。所有者、角色、父智能体和已保存
+运行的明确限制仍然生效，子智能体不能移除它们。不会额外套用 2,000 回合或 24
+小时的子智能体上限。续跑保留已有运行的剩余步骤和绝对截止时间。
 
-例如，一次聚焦的审查可以这样请求：
+并发限制会让工作排队，而不会为完成任务猜测一个预算。没有所有者截止时间时，
+子智能体等待可用槽位或取消。有明确时间预算时，排队最多等待该时长；未能启动会
+以 `never started` 和零工作量报告。取得槽位后开始工作计时，但仍受继承的绝对
+截止时间约束。截止时间会被保存，排队状态会显示等待原因和实际存在的截止时间。
+
+示例：
 
 ```json
 {
   "action": "start",
   "type": "reviewer",
-  "prompt": "Review the parser diff and report concrete regressions.",
-  "max_steps": 12,
-  "wall_time_secs": 300
+  "prompt": "审查解析器差异，报告具体回归并提供文件和行号证据。"
 }
 ```
 
-回执中的 `effective_limits` 才是权威；请求 300 秒并不能延长父智能体更早的截止时间。续跑会保留来源剩余的步数、原始截止时间和 token 历史。新的 ID、角色或 `resume_from` 分叉都无法重置这些界限。
+### 用量与部分结果
 
-### Token 记账与部分结果
+Token 用量只用于记账，不会作为整次运行的终止预算。旧的 `token_budget` 参数
+会被忽略。记账依据提供商报告；缺失的用量保持未知。上下文压缩让子智能体在对话
+增长时继续工作。单次请求仍受提供商上下文和输出容量限制，未完整生成的工具参数
+绝不会被执行。
 
-Token 预算已在 0.9.14 中退役：token 用量会被追踪，但绝不强制执行——运行不再因为 token 记账而被停止。仍带有 `token_budget` 的旧输入可以被解析，但会被忽略；`max_steps` 和 `wall_time_secs` 仍是可收窄的逐次调用限制。
+所有者明确设置的步骤或时间限制结束运行时，现有交还路径会保存部分工作，并在
+剩余额度内尝试一次禁用工具的报告。报告输入和输出的固定总额度最多为 8,192
+个 token，输出最多为 1,024 个 token。至少两步的上限会预留一个报告回合；时间
+上限最多预留 10 秒用于报告。这些预留不会给原本无界的运行添加上限。
 
-调节器使用提供商报告的输入加输出 token，而不是把本地估算当作账单。请求的输出会被限制在剩余额度之内。未知的提示词用量和已经在途的请求可能超支；回执会保留完整的报告用量。缺失的用量保持未知。`worker` 记录会区分该 `worker` 自己的 token 总量，与共享的 `budget_spent_tokens` 和 `budget_remaining_tokens`；不要为每个后代都把共享池累加一次。
-
-`worker` 会在这些限制内预留出写一份最终报告的余量：token 额度的至多 10%（最多 8192 个 token，且仅当至少能预留 1024 时），在步数上限允许至少两步时预留一个回合，以及墙钟时间的至多 10%（最多 10 秒）。普通的任务执行会在用到这份预留之前停下。共享作用域会为该作用域扣留一份 token 预留；正在汇报的 `worker` 以原子方式认领剩余余量，使同级 `worker` 无法各自重复使用它。续跑绝不会退还已测得的用量，也不会重置原始截止时间。
-
-最终汇报回合使用该 `worker` 已解析好的提供商和模型，禁用工具，输出最多 1024 个 token。它把有界的助手备注和工具结果整合为发现、证据、产出的文件、未完成的工作和下一步。估算的输入成本计入它的额度。提供商传输层的重试保留在这一个逻辑回合及其原始墙钟截止时间之内；不会额外增加 `worker` 摘要的重试循环。Token 估算不是计费回执：未知的提供商输入和已经在途的请求仍可能超支，实际用量会被记录。
-
-结果仍是 `BudgetExhausted`，即使拿到了有用的报告也是如此，并附带具体原因、检查点、已测得的用量和正常的交付物判定。如果额度太小或已经用完、更早的有界用量未知、提供商失败或时间到期，`worker` 会返回已记录的部分文本，并说明为什么无法得到模型报告。已知缺失的响应用量，以及被超时或取消打断的尝试，会在续跑和共享的同级之间保持记录；之后已知的用量仍然只是一个小计，无法在该有界作用域内恢复汇报余量。取消优先于汇报。缺失的用量保持未知。已耗尽的作用域会拒绝进一步的生成或续跑；部分报告不算成功完成。
+即使报告有用，结果仍然是 `BudgetExhausted`，不会伪称成功完成。无法生成报告时，
+回执保留已记录的工作并说明原因。工作期间和排队期间都可以取消。未知的提供商
+用量不会被记为零。
 
 ## 各角色模型（#3018）
 

@@ -23,6 +23,7 @@ export const chrome: ChromeDict = {
   navCommunity: "समुदाय",
   navContribute: "योगदान",
 
+  navFeatures: "क्षमताएँ",
   navProduct: "उत्पाद",
   navModels: "मॉडल",
   navPlugins: "प्लगइन",
@@ -33,8 +34,6 @@ export const chrome: ChromeDict = {
   navHomeAria: "Codewhale होम",
 
   installCta: "इंस्टॉल करें →",
-
-  authSignIn: "साइन इन करें",
 
   dateLocale: "hi-IN",
 
@@ -48,7 +47,7 @@ export const chrome: ChromeDict = {
   themeTitle: "थीम · ऑटो / लाइट / डार्क",
 
   footerTagline:
-    "अपनी पसंद के मॉडल से जो चाहें बनाएँ और रोज़मर्रा के काम स्वचालित करें।",
+    "आपके टर्मिनल और आपकी पसंद के मॉडल के लिए ओपन-सोर्स कोडिंग एजेंट।",
   footerProduct: "उत्पाद",
   footerProject: "प्रोजेक्ट",
   footerDocs: "दस्तावेज़ीकरण",

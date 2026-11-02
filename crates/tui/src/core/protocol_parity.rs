@@ -29,7 +29,7 @@ use serde_json::Value;
 
 use crate::agent_roster::{AgentRosterRow, RosterState};
 use crate::compaction::CompactionConfig;
-use crate::config::ApiProvider;
+use crate::config::ProviderKind;
 use crate::core::engine::preview::PreviewUnresolved;
 use crate::core::events::{
     Event, RouteBillingEnvelope, ToolGate, ToolGateVerdict, TurnOutcomeStatus, TurnRoute,
@@ -135,7 +135,7 @@ fn capability_metadata_str(metadata: McpServerCapabilityMetadata) -> &'static st
     }
 }
 
-fn provider_str(provider: ApiProvider) -> String {
+fn provider_str(provider: ProviderKind) -> String {
     provider.as_str().to_string()
 }
 
@@ -390,12 +390,16 @@ fn turn_spec_to_wire(spec: &crate::core::ops::TurnSpec) -> wire_op::TurnSpec {
     // so wire submitters observe `TurnStarted.submission_id` always absent
     // and cannot correlate submissions on that channel.
     wire_op::TurnSpec {
+        profile_constitution: spec
+            .profile_constitution
+            .as_ref()
+            .map(|snapshot| serde_json::json!(snapshot)),
         max_output_tokens: spec.max_output_tokens,
         content: spec.content.clone(),
         images: spec.images.clone(),
         mode: app_mode_str(spec.mode).to_string(),
         model: Some(spec.route.model.clone()),
-        model_provider: Some(spec.route.identity.key.clone()),
+        model_provider: Some(spec.route.identity.key.to_string()),
         allowed_tools: spec.allowed_tools.clone(),
         dynamic_tools: spec.dynamic_tools.clone(),
         provenance: spec.provenance.as_str().to_string(),
@@ -450,6 +454,25 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             omitted_tool_names: omitted_tool_names.clone(),
             omitted_tool_count: count(*omitted_tool_count),
         },
+        Event::RequestImageWindow {
+            provider,
+            model,
+            total,
+            elided,
+            cap,
+            cap_source,
+            message,
+        } => wire::EventMsg::RequestImageWindow {
+            thread_id,
+            session_id,
+            provider: provider.clone(),
+            model: model.clone(),
+            total: count(*total),
+            elided: count(*elided),
+            cap: count(*cap),
+            cap_source: cap_source.clone(),
+            message: message.clone(),
+        },
         Event::SnapshotsDisabled { workspace, reason } => wire::EventMsg::SnapshotsDisabled {
             thread_id,
             session_id,
@@ -490,6 +513,17 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             session_id,
             index: count(*index),
         },
+        Event::ToolExecutionStarted { id } => wire::EventMsg::ToolExecutionStarted {
+            thread_id,
+            session_id,
+            tool_call_id: id.clone(),
+        },
+        Event::ToolResultContent { id, blocks } => wire::EventMsg::ToolResultContent {
+            thread_id,
+            session_id,
+            tool_call_id: id.clone(),
+            blocks: to_value(blocks),
+        },
         Event::ToolCallStarted {
             id, name, input, ..
         } => wire::EventMsg::ToolCallStarted {
@@ -524,21 +558,25 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
         Event::OperationActivityStarted {
             span_id,
             activity_kind,
+            action_id,
         } => wire::EventMsg::OperationActivityStarted {
             thread_id,
             session_id,
             span_id: span_id.clone(),
             activity_kind: *activity_kind,
+            action_id: action_id.clone(),
         },
         Event::OperationActivityCompleted {
             span_id,
             activity_kind,
+            action_id,
             outcome,
         } => wire::EventMsg::OperationActivityCompleted {
             thread_id,
             session_id,
             span_id: span_id.clone(),
             activity_kind: *activity_kind,
+            action_id: action_id.clone(),
             outcome: *outcome,
         },
         Event::TurnStarted {
@@ -571,6 +609,9 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             route: route_to_wire(route),
         },
         Event::TurnComplete {
+            turn_id,
+            submission_id,
+            compaction_id,
             usage,
             parent_route_usage,
             routed_usage_dropped_records,
@@ -581,7 +622,9 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
         } => wire::EventMsg::TurnComplete {
             thread_id,
             session_id,
-            turn_id: None,
+            turn_id: turn_id.clone(),
+            submission_id: submission_id.clone(),
+            compaction_id: compaction_id.clone(),
             status: outcome_status_to_wire(*status),
             error: error.clone(),
             usage: usage_to_wire(usage),
@@ -592,12 +635,18 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
                 .map(|tools| tools.iter().map(to_value).collect()),
             base_url: base_url.clone(),
         },
+        Event::ProviderRequestReceipt { receipt } => wire::EventMsg::ProviderRequestReceipt {
+            thread_id,
+            session_id,
+            receipt: receipt.clone(),
+        },
         Event::TurnUsage {
             max_output_tokens,
             usage,
             duration_ms,
             first_token_ms,
             request_ms,
+            finish_reason: _,
         } => wire::EventMsg::TurnUsage {
             max_output_tokens: *max_output_tokens,
             thread_id,
@@ -903,6 +952,11 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             intent_summary: intent_summary.clone(),
             approval_force_prompt: *approval_force_prompt,
         },
+        Event::ApprovalWithdrawn { id } => wire::EventMsg::ApprovalWithdrawn {
+            thread_id,
+            session_id,
+            id: id.clone(),
+        },
         Event::UserInputRequired { id, request } => wire::EventMsg::UserInputRequired {
             thread_id,
             session_id,
@@ -1183,7 +1237,7 @@ pub fn op_to_protocol(op: &Op) -> wire_op::Op {
         } => wire_op::Op::CompactContext {
             id: id.clone(),
             model: route.model.clone(),
-            model_provider: route.identity.key.clone(),
+            model_provider: route.identity.key.to_string(),
             compaction: compaction_to_wire(compaction),
         },
         Op::CancelCompaction { id } => wire_op::Op::CancelCompaction { id: id.clone() },
@@ -1347,6 +1401,9 @@ mod tests {
         };
         let complete = event_to_protocol(
             &Event::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id: None,
                 usage: total.clone(),
                 parent_route_usage: parent.clone(),
                 routed_usage_dropped_records: 3,
@@ -1393,6 +1450,7 @@ mod tests {
                     duration_ms: 12,
                     first_token_ms: Some(2),
                     request_ms: Some(10),
+                    finish_reason: None,
                 },
                 "turn_usage",
             ),
@@ -1414,6 +1472,26 @@ mod tests {
                 projected
             );
         }
+    }
+
+    #[test]
+    fn manual_compaction_terminal_keeps_its_operation_id_in_projection() {
+        let event = Event::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: Some("compact-1".into()),
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: TurnOutcomeStatus::Failed,
+            error: Some("route rejected".into()),
+            tool_catalog: None,
+            base_url: None,
+        };
+        let value = serde_json::to_value(event.to_protocol(&ids())).unwrap();
+        assert_eq!(value["compaction_id"], "compact-1");
+        assert!(value.get("turn_id").is_none());
+        assert!(value.get("submission_id").is_none());
     }
 
     /// The guard is the exhaustive `match` in `event_to_protocol`: this test
@@ -1465,6 +1543,9 @@ mod tests {
                 submission_id: Some("sub-host-1".into()),
             },
             Event::TurnComplete {
+                turn_id: Some("turn-1".into()),
+                submission_id: Some("sub-host-1".into()),
+                compaction_id: None,
                 usage: usage.clone(),
                 parent_route_usage: usage.clone(),
                 routed_usage_dropped_records: 0,
@@ -1496,6 +1577,7 @@ mod tests {
                 duration_ms: 12,
                 first_token_ms: Some(3),
                 request_ms: None,
+                finish_reason: None,
             },
             Event::Error {
                 envelope: ErrorEnvelope {
@@ -1572,6 +1654,10 @@ mod tests {
             serde_json::to_value(events[8].to_protocol(&ids)).unwrap()["status"],
             "interrupted"
         );
+        let terminal = serde_json::to_value(events[8].to_protocol(&ids)).unwrap();
+        assert_eq!(terminal["turn_id"], "turn-1");
+        assert_eq!(terminal["submission_id"], "sub-host-1");
+        assert!(terminal.get("compaction_id").is_none());
         let error = events
             .iter()
             .find(|event| matches!(event, Event::Error { .. }))
@@ -1749,5 +1835,30 @@ mod tests {
             wildcard_arms.is_empty(),
             "protocol_parity.rs must match engine variants exhaustively; found {wildcard_arms:?}"
         );
+    }
+    #[test]
+    fn acp_optional_tool_facts_round_trip_with_core_routing_identity() {
+        let ids = ids();
+        for event in [
+            Event::ToolExecutionStarted {
+                id: "core-call".into(),
+            },
+            Event::ToolResultContent {
+                id: "core-call".into(),
+                blocks: vec![codewhale_tools::ToolResultContentBlock::Image {
+                    mime_type: "image/png".into(),
+                    data: "QUJD".into(),
+                }],
+            },
+        ] {
+            let projected = event_to_protocol(&event, &ids);
+            assert_eq!(projected.thread_id(), &ids.thread_id);
+            assert_eq!(projected.session_id(), &ids.session_id);
+            let value = serde_json::to_value(&projected).unwrap();
+            assert_eq!(
+                serde_json::from_value::<wire::EventMsg>(value).unwrap(),
+                projected
+            );
+        }
     }
 }

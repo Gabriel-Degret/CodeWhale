@@ -38,9 +38,10 @@ the code actually guarantees — no more:
   selectable preset to the same floors: body, soft, and muted text at 4.5:1
   on every primary surface (including selection and error surfaces); hint and
   dim text at 3:1; status, warning, success, and info roles at 3:1 because
-  they are redundant — every status also carries a glyph and a word label,
-  so color is never the only channel. Diff foreground/background pairs are
-  held to 3:1.
+  they are redundant — every status also carries a glyph, and every state
+  except a finished, successful shell command also carries a word label (that
+  card's `✓`, ASCII `Y`, stands alone), so color is never the only channel.
+  Diff foreground/background pairs are held to 3:1.
 * The **Terminal** (transparent) theme is exempt by design: it paints
   `Color::Reset` surfaces and ANSI accents so the host terminal's own scheme
   shows through. Those colors are terminal-owned and cannot be measured, so
@@ -114,14 +115,14 @@ version renders cleanly.
   Terminal) will pass the rendered content straight through.
 * If you find a UI surface that still produces motion when
   `low_motion = true`, please file an issue against
-  [`PRIOR: Screen-reader / accessibility flag`](https://github.com/Hmbown/CodeWhale/issues/450)
+  [`PRIOR: Screen-reader / accessibility flag`](https://github.com/codewhale-hq/CodeWhale/issues/450)
   with a screenshot or terminal recording.
 
 ## Related issues / history
 
-* [#450](https://github.com/Hmbown/CodeWhale/issues/450) —
+* [#450](https://github.com/codewhale-hq/CodeWhale/issues/450) —
   documenting the existing flag, adding the `NO_ANIMATIONS`
   startup overlay, and writing this page.
-* [#449](https://github.com/Hmbown/CodeWhale/issues/449) —
+* [#449](https://github.com/codewhale-hq/CodeWhale/issues/449) —
   footer statusline now uses the active theme's contrast pair
   instead of a bespoke palette.

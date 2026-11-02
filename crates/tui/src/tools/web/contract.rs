@@ -31,6 +31,8 @@ pub(crate) enum BackendId {
     Volcengine,
     Sofya,
     Serply,
+    #[serde(rename = "deepseek")]
+    DeepSeek,
 }
 
 impl BackendId {
@@ -49,6 +51,7 @@ impl BackendId {
             Self::Volcengine => "volcengine",
             Self::Sofya => "sofya",
             Self::Serply => "serply",
+            Self::DeepSeek => "deepseek",
         }
     }
 }
@@ -206,6 +209,14 @@ pub(crate) enum DegradedReason {
     /// The provider stopped a native search answer at its output limit, so
     /// the answer is incomplete (#6508).
     AnswerCutByProvider,
+    CitationUnverified {
+        url: String,
+        reason: String,
+    },
+    CitationUnchecked {
+        url: String,
+        reason: String,
+    },
 }
 
 impl DegradedReason {
@@ -244,8 +255,23 @@ impl DegradedReason {
                 "the provider stopped the search answer at its output limit; the answer is incomplete"
                     .to_string()
             }
+            Self::CitationUnverified { url, reason } => {
+                format!("provider citation {url} failed link verification ({reason}) and was removed")
+            }
+            Self::CitationUnchecked { url, reason } => {
+                format!("provider citation {url} was not checked ({reason}) and stays in results unverified")
+            }
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CapturedSearchEntry {
+    pub(crate) title: String,
+    pub(crate) url: String,
+    pub(crate) snippet: Option<String>,
+    pub(crate) published: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,6 +362,8 @@ pub(crate) struct SearchResponse {
     pub(crate) count: usize,
     pub(crate) message: String,
     pub(crate) results: Vec<SearchResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) unverified_synthesis: Option<String>,
     pub(crate) receipt: SearchReceipt,
 }
 

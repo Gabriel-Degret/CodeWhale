@@ -10,8 +10,41 @@ average 10–27, recorded next to each number), so treat them as relative
 before/after evidence, not benchmarks.
 
 > Split plan: [TUI deconstruction](design/TUI_DECONSTRUCTION.md) contains the
-> September 9 source audit and current proposed extraction order. Measurements
+> current source audit, target crate map and extraction order. Measurements
 > below are historical; the B3/deferred candidate lists are not an execution queue.
+
+## October 22, 2026: shared Engine future boundary
+
+The 0.10.2 candidate's `crates/tui/src` has 1,040 Rust files and 1,279,727
+physical lines including tests. Filtering test names still compiles the one
+large library-test target. The older measurements below describe an earlier
+source tree and compiler.
+
+Two successive local builds on the 14-core Apple Silicon machine, with Rust
+1.99.0, the same incremental cache, features and development profile:
+
+| Candidate build | Wall time |
+| --- | ---: |
+| Shared Engine loop returned its full concrete future | 29m 31s |
+| `Engine::run_owned` returned a boxed `Send` future | 2m 24s |
+
+A native sample of the first build found recursive trait-obligation work during
+monomorphization and MIR validation on one compiler thread. The existing shared
+loop now erases its future type at that boundary; root and child engines retain
+the same event loop. It adds one allocation per Engine invocation. The second
+build also corrected three existing test assertions and collected Cargo
+`--timings`. These are warm local observations, not an isolated benchmark or a
+cold-build, release-build or cross-platform speedup promise. The 2,172 captured
+inputs stayed unchanged during each build and its focused checks; 58 relevant
+existing checks passed after the boundary change. Final release validation is
+separate.
+
+Keep incremental compilation and the existing line-table debug setting for the
+local edit loop. Finish a coherent batch before compiling, then reuse its test
+binary for relevant filters while inputs stay unchanged. Capture timings on a
+build already needed for validation. The structural follow-up remains the
+[TUI deconstruction](design/TUI_DECONSTRUCTION.md): move implementation and its
+existing tests together so each subsystem can build independently.
 
 ## Where the time goes (baseline, commit 533c530b)
 
@@ -153,11 +186,17 @@ Defaults never contain a machine-specific absolute path:
 export CODEWHALE_CACHE_ROOT=/path/to/cache/codewhale
 
 scripts/dev-cache.sh --self-check
-scripts/dev-test.sh crates/runtime/src/elapsed.rs
+scripts/dev-test.sh crates/command-contract/src/elapsed.rs
 CARGO_INCREMENTAL=0 scripts/dev-cargo.sh test -p codewhale-config --lib --locked --no-run
 ```
 
 Hermetic script test (no rustc compile): `sh scripts/dev-cache.test.sh`.
+When the repository build lock governs Cargo, the entry point disables the
+external `cargowhale` governor for that process. Running both governors can
+replace the selected cache and recreate deleted tracked files while forcing
+their timestamps. Keep one build owner and a frozen source manifest; a build
+helper must not change that source. This leaves the machine's global settings
+unchanged.
 `scripts/dev-test.sh --self-check` reports the helper's resolved cache
 topology; its own script test, `scripts/dev-test.test.sh`, was removed in
 `d64b9429b7`.
@@ -204,10 +243,12 @@ every workspace crate.
 
 ### A2 nextest in CI
 
-`cargo test --workspace --all-features --locked --doc` inventories
-**3 passing / 8 ignored doctests across 21 crates**; CI keeps them as a
-separate step next to `cargo nextest run --workspace --all-features
---locked --profile ci`.
+`cargo test --workspace --all-features --locked --doc` inventoried
+**3 passing / 8 ignored doctests across 21 crates**. All 8 ignored fences
+were in codewhale-tui, which has no runnable doc example and now sets
+`doctest = false`, so its doc pass is skipped (the new inventory is not
+re-measured yet). CI keeps the doc run as a separate step next to
+`cargo nextest run --workspace --all-features --locked --profile ci`.
 
 ### A3/A4 (not adopted, measured)
 

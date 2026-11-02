@@ -41,7 +41,7 @@
 - **聊天机器人**：只回答你的问题，不动你电脑上的任何东西
 - **Codewhale**：给它一个任务，它能读你的文件、修改代码、在终端里运行命令、自己检查结果，做完或需要你拍板时才停下
 
-它运行在**你自己的电脑**上（开源，项目地址 `https://github.com/Hmbown/CodeWhale`），所以它能动你的真实文件。
+它运行在**你自己的电脑**上（开源，项目地址 `https://github.com/codewhale-hq/CodeWhale`），所以它能动你的真实文件。
 
 ### 1.2 模型由你自己带（自带 API key）
 
@@ -192,7 +192,7 @@ codewhale auth set --provider moonshot --api-key "你的中国区Kimi API key"
 打开官方发布页：
 
 ```
-https://github.com/Hmbown/CodeWhale/releases
+https://github.com/codewhale-hq/CodeWhale/releases
 ```
 
 在最新版本的文件列表中，普通 Windows 电脑（Intel/AMD 处理器）**推荐下载 `codewhale-windows-x64-portable.zip`（Windows 便携版）**。
@@ -412,7 +412,7 @@ default_text_model = "deepseek-v4-pro"
 | `/setup` | 重新打开首次设置流程 |
 | `/compact` | 对话太长时压缩上下文、省 token |
 | `/review` | 让 AI 对代码做结构化审查 |
-| `/skills` | 打开技能管理器 |
+| `/skills` | 打开 Extensions → Skills；`/skills manage` 打开技能管理器 |
 | `/status` | 查看当前模型/路由等状态 |
 | `/export` | 导出对话 |
 | `/constitution` | 管理宪章（高级） |

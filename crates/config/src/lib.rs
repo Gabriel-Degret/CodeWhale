@@ -16,6 +16,7 @@ mod opencode_go;
 pub use opencode_go::{opencode_go_endpoint_key, opencode_go_model_id, opencode_go_models};
 pub mod persistence;
 pub mod pricing;
+pub mod private_directory;
 pub mod provider;
 mod provider_defaults;
 mod provider_kind;
@@ -25,16 +26,20 @@ pub mod route;
 pub mod settings_schema;
 pub mod setup_state;
 pub mod user_constitution;
+#[cfg(windows)]
+pub mod windows_identity;
 mod xai_credentials;
 pub use config_document::{
     ConfigDocumentUndo, create_config_document, migrate_legacy_root_config, mutate_config_document,
-    mutate_config_document_undoable, mutate_config_document_with_migration,
-    preview_legacy_root_config, replace_config_document_if_unchanged, set_config_document_value,
-    unset_config_document_value, with_config_write_lock,
+    mutate_config_document_undoable, mutate_config_document_undoable_with_migration,
+    mutate_config_document_with_migration, preview_legacy_root_config,
+    replace_config_document_if_unchanged, set_config_document_value, unset_config_document_value,
+    with_config_write_lock,
 };
 pub use model_reference::{Modality, ModelReferenceCard, ModelReferenceDatabase};
 pub(crate) use provider_defaults::*;
 pub use provider_kind::ProviderKind;
+pub use route::ProviderId;
 pub use settings_schema::{
     SETTINGS_SCHEMA, SettingDef, SettingKind, SettingOption, SettingUi, schema_groups, schema_rows,
     schema_tabs, setting, setting_index,
@@ -52,16 +57,19 @@ pub use user_constitution::{
     UserConstitution, UserConstitutionLoad,
 };
 pub use xai_credentials::{
-    CHATGPT_OAUTH_GENERATION_PREFIX, CHATGPT_OAUTH_GENERATION_SUFFIX,
-    LEGACY_CHATGPT_OAUTH_FILE_NAME, LEGACY_XAI_OAUTH_FILE_NAME, XAI_OAUTH_GENERATION_PREFIX,
+    CHATGPT_HOST_FILE_NAME, CHATGPT_OAUTH_GENERATION_PREFIX, CHATGPT_OAUTH_GENERATION_SUFFIX,
+    CLAUDE_OAUTH_GENERATION_PREFIX, CLAUDE_OAUTH_GENERATION_SUFFIX, LEGACY_CHATGPT_OAUTH_FILE_NAME,
+    LEGACY_CLAUDE_OAUTH_FILE_NAME, LEGACY_XAI_OAUTH_FILE_NAME, XAI_OAUTH_GENERATION_PREFIX,
     XAI_OAUTH_GENERATION_SUFFIX, XaiOAuthCredentialStore, XaiOAuthRevocation,
-    chatgpt_oauth_generation_path, clear_all_chatgpt_oauth_credentials,
-    clear_all_chatgpt_oauth_credentials_locked, clear_all_xai_oauth_credentials,
-    is_valid_chatgpt_oauth_generation, is_valid_xai_oauth_generation, legacy_chatgpt_oauth_path,
-    legacy_xai_oauth_path, remove_chatgpt_oauth_generation, remove_xai_oauth_generation,
-    validate_chatgpt_oauth_generation, validate_xai_oauth_generation,
-    with_xai_oauth_lifecycle_lock, with_xai_oauth_revocation_transaction,
-    xai_oauth_credentials_dir, xai_oauth_generation_path,
+    chatgpt_oauth_generation_path, claude_oauth_generation_path,
+    clear_all_chatgpt_oauth_credentials, clear_all_chatgpt_oauth_credentials_locked,
+    clear_all_claude_oauth_credentials_locked, clear_all_xai_oauth_credentials,
+    is_valid_chatgpt_oauth_generation, is_valid_claude_oauth_generation,
+    is_valid_xai_oauth_generation, legacy_chatgpt_oauth_path, legacy_xai_oauth_path,
+    remove_chatgpt_oauth_generation, remove_xai_oauth_generation,
+    validate_chatgpt_oauth_generation, validate_claude_oauth_generation,
+    validate_xai_oauth_generation, with_xai_oauth_lifecycle_lock,
+    with_xai_oauth_revocation_transaction, xai_oauth_credentials_dir, xai_oauth_generation_path,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1637,6 +1645,9 @@ mod provider_chain_tests {
 pub struct HookSinksToml {
     /// Unix domain socket path used by the app-server event sink.
     ///
+    /// Known limitation: only `codewhale app-server` reads this table; the
+    /// TUI and the Runtime API do not dispatch hook events to it.
+    ///
     /// When unset, no Unix socket sink is registered. There is deliberately no
     /// shared `/tmp` default because socket ownership should be explicit.
     #[serde(default)]
@@ -1767,31 +1778,15 @@ pub struct FleetConfigToml {
     pub exec: FleetExecConfig,
 }
 
-/// Canonical recursion-depth policy for the headless worker runtime.
-///
-/// Single source of truth shared by BOTH standalone sub-agents and fleet
-/// workers so the two cannot drift into "two moving targets":
-/// - [`DEFAULT_SPAWN_DEPTH`] is the default recursion budget (the sub-agent
-///   runtime's `DEFAULT_MAX_SPAWN_DEPTH` is defined as this value).
-/// - [`MAX_SPAWN_DEPTH_CEILING`] is the opt-in safety cap; every configured
-///   value (fleet `max_spawn_depth`, the `agent` tool's `max_depth`) clamps to it.
-///
-/// A worker runs at `spawn_depth = 0` and may spawn while
-/// `spawn_depth + 1 <= max_spawn_depth`, so a depth of N affords N nested
-/// delegation levels below the root worker. The default of 3 affords at least
-/// three recursion levels out of the box; the root worker still runs at
-/// depth 0 even when the budget is 0.
-pub const DEFAULT_SPAWN_DEPTH: u32 = 3;
+/// Runtime delegation has no default product depth limit. Explicit owner
+/// values still restrict child authority; zero disables delegation.
+pub const DEFAULT_SPAWN_DEPTH: u32 = u32::MAX;
 pub const DEFAULT_STREAM_CHUNK_TIMEOUT_SECS: u64 = 900;
 pub const MIN_STREAM_CHUNK_TIMEOUT_SECS: u64 = 1;
 pub const MAX_STREAM_CHUNK_TIMEOUT_SECS: u64 = 3600;
 
-/// Hard ceiling on recursion depth for any worker/sub-agent. The default stays
-/// conservative at [`DEFAULT_SPAWN_DEPTH`], while explicit config can opt into
-/// deeper trees for direct-API providers that can tolerate the fanout.
-/// Raising this single constant lifts the limit everywhere (the fleet clamp
-/// and `agent` validation both read it).
-pub const MAX_SPAWN_DEPTH_CEILING: u32 = 8;
+/// Largest representable absolute depth; admission rejects arithmetic overflow.
+pub const MAX_SPAWN_DEPTH_CEILING: u32 = u32::MAX;
 
 /// Headless worker execution constraints (#3027).
 ///
@@ -1811,10 +1806,8 @@ pub struct FleetExecConfig {
     #[serde(default = "default_fleet_max_turns")]
     pub max_turns: u32,
     /// Recursive child-agent budget for headless fleet workers.
-    /// Defaults to [`DEFAULT_SPAWN_DEPTH`] (3) so a fleet worker has the SAME
-    /// recursion budget as a standalone sub-agent — fleet and sub-agents are one
-    /// substrate, not two. Set 0 to block child `agent` calls (the root worker
-    /// still runs); the value is clamped to [`MAX_SPAWN_DEPTH_CEILING`].
+    /// Defaults to [`DEFAULT_SPAWN_DEPTH`], with no product depth cap.
+    /// Set zero to block child delegation while preserving the root worker.
     #[serde(default = "default_fleet_max_spawn_depth")]
     pub max_spawn_depth: u32,
     /// Extra system prompt text appended to every headless worker.
@@ -2209,7 +2202,7 @@ pub struct WorkflowConfigToml {
     /// elevate shell/network, or otherwise leave the read-only envelope.
     #[serde(default = "default_workflow_require_approval_for_writes")]
     pub require_approval_for_writes: bool,
-    /// Hard ceiling on total children in one Workflow run (product: 1000).
+    /// Operator-selected total child limit. Zero leaves total work uncapped.
     #[serde(default = "default_workflow_max_children")]
     pub max_children: u32,
     /// Maximum concurrently live agents inside one Workflow run (product: 16).
@@ -2217,13 +2210,11 @@ pub struct WorkflowConfigToml {
     pub max_concurrent: u32,
     /// Maximum structural nesting depth accepted for Workflow IR.
     ///
-    /// This is independent of Runtime child delegation, whose default is 3
-    /// and whose opt-in hard ceiling is 8.
+    /// Zero leaves structural depth uncapped. Runtime delegation is separate.
     #[serde(default = "default_workflow_max_depth")]
     pub max_depth: u32,
-    /// Default shared token budget for a Workflow run and its children.
-    /// `0` applies no shared cap — the run is advisory-only like the parent
-    /// turn loop — while any positive value is enforced across the run.
+    /// Legacy declared token hint retained in Workflow receipts. The current
+    /// runtime does not meter or enforce this value. Zero omits the hint.
     #[serde(default = "default_workflow_default_token_budget")]
     pub default_token_budget: u64,
 }
@@ -2241,7 +2232,7 @@ fn default_workflow_require_approval_for_writes() -> bool {
 }
 
 fn default_workflow_max_children() -> u32 {
-    1000
+    0
 }
 
 fn default_workflow_max_concurrent() -> u32 {
@@ -2249,14 +2240,10 @@ fn default_workflow_max_concurrent() -> u32 {
 }
 
 fn default_workflow_max_depth() -> u32 {
-    5
+    0
 }
 
 fn default_workflow_default_token_budget() -> u64 {
-    // Off by default: a cap the caller never asked for must not throttle a
-    // run — a 120k default silently killed real fan-outs mid-task (#6189).
-    // Spend discipline stays available as an explicit opt-in (tool
-    // `token_budget`, spec `budget.max_tokens`, or a configured value here).
     0
 }
 
@@ -3501,6 +3488,7 @@ impl ConfigToml {
             saved_provider_model: None,
             base_url_override: Some(base_url.clone()),
             limit_overrides: Vec::new(),
+            wire_override: None,
         });
 
         let mut http_headers = self.http_headers.clone();
@@ -4030,16 +4018,12 @@ fn deepseek_family_model_id(model: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    match trimmed.to_ascii_lowercase().as_str() {
-        "pro" | "deepseek-v4pro" => return Some("deepseek-v4-pro".to_string()),
-        "flash" | "deepseek-v4flash" => return Some("deepseek-v4-flash".to_string()),
-        "flash-vision" | "deepseek-v4flashvisionexp" => {
-            return Some("deepseek-v4-flash-vision-exp".to_string());
-        }
-        _ => {}
-    }
-
     let normalized = trimmed.to_ascii_lowercase();
+    if let Some(canonical) =
+        crate::catalog::reviewed::compatibility_alias("canonical_model_name", &normalized)
+    {
+        return Some(canonical.to_string());
+    }
     if !normalized.starts_with("deepseek") && !normalized.contains("/deepseek") {
         return None;
     }
@@ -4242,43 +4226,45 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
         }
         (
             ProviderKind::NvidiaNim,
-            "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-reasoner"
-            | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat"
+            | "deepseek-reasoner" | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
         ) => DEFAULT_NVIDIA_NIM_FLASH_MODEL.to_string(),
         (ProviderKind::Openrouter, "deepseek-v4-pro" | "deepseek-v4pro") => {
             DEFAULT_OPENROUTER_MODEL.to_string()
         }
         (
             ProviderKind::Openrouter,
-            "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-reasoner"
-            | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat"
+            | "deepseek-reasoner" | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
         ) => DEFAULT_OPENROUTER_FLASH_MODEL.to_string(),
         (ProviderKind::Orcarouter, "deepseek-v4-pro" | "deepseek-v4pro") => {
-            DEFAULT_ORCAROUTER_MODEL.to_string()
+            "deepseek/deepseek-v4-pro".to_string()
         }
         (
             ProviderKind::Orcarouter,
-            "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-reasoner"
-            | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat"
+            | "deepseek-reasoner" | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
         ) => DEFAULT_ORCAROUTER_FLASH_MODEL.to_string(),
         (ProviderKind::Novita, "deepseek-v4-pro" | "deepseek-v4pro") => {
             DEFAULT_NOVITA_MODEL.to_string()
         }
         (
             ProviderKind::Novita,
-            "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-reasoner"
-            | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat"
+            | "deepseek-reasoner" | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
         ) => DEFAULT_NOVITA_FLASH_MODEL.to_string(),
         (ProviderKind::Fireworks, "deepseek-v4-pro" | "deepseek-v4pro") => {
             DEFAULT_FIREWORKS_MODEL.to_string()
         }
+        (ProviderKind::Fireworks, "deepseek-flash") => "deepseek-v4-flash".to_string(),
         (
             ProviderKind::Siliconflow | ProviderKind::SiliconflowCN,
             "deepseek-v4-pro" | "deepseek-v4pro" | "deepseek-reasoner" | "deepseek-r1",
         ) => DEFAULT_SILICONFLOW_MODEL.to_string(),
         (
             ProviderKind::Siliconflow | ProviderKind::SiliconflowCN,
-            "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-v3",
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat"
+            | "deepseek-v3",
         ) => DEFAULT_SILICONFLOW_FLASH_MODEL.to_string(),
         (
             ProviderKind::Arcee,
@@ -4309,40 +4295,40 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
         }
         (
             ProviderKind::Sglang,
-            "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-reasoner"
-            | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat"
+            | "deepseek-reasoner" | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
         ) => DEFAULT_SGLANG_FLASH_MODEL.to_string(),
         (ProviderKind::Vllm, "deepseek-v4-pro" | "deepseek-v4pro") => {
             DEFAULT_VLLM_MODEL.to_string()
         }
         (
             ProviderKind::Vllm,
-            "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-reasoner"
-            | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat"
+            | "deepseek-reasoner" | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
         ) => DEFAULT_VLLM_FLASH_MODEL.to_string(),
         (ProviderKind::Huggingface, "deepseek-v4-pro" | "deepseek-v4pro") => {
             DEFAULT_HUGGINGFACE_MODEL.to_string()
         }
         (
             ProviderKind::Huggingface,
-            "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-reasoner"
-            | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat"
+            | "deepseek-reasoner" | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
         ) => DEFAULT_HUGGINGFACE_FLASH_MODEL.to_string(),
         (ProviderKind::Together, "deepseek-v4-pro" | "deepseek-v4pro") => {
             DEFAULT_TOGETHER_MODEL.to_string()
         }
         (
             ProviderKind::Together,
-            "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-reasoner"
-            | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat"
+            | "deepseek-reasoner" | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
         ) => DEFAULT_TOGETHER_FLASH_MODEL.to_string(),
         (ProviderKind::Deepinfra, "deepseek-v4-pro" | "deepseek-v4pro") => {
             DEFAULT_DEEPINFRA_MODEL.to_string()
         }
         (
             ProviderKind::Deepinfra,
-            "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-reasoner"
-            | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat"
+            | "deepseek-reasoner" | "deepseek-r1" | "deepseek-v3" | "deepseek-v3.2",
         ) => DEFAULT_DEEPINFRA_FLASH_MODEL.to_string(),
         _ => model.to_string(),
     }
@@ -4354,6 +4340,10 @@ fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {
     match normalized.as_str() {
         "mimo"
         | DEFAULT_XIAOMI_MIMO_MODEL
+        | "mimo-v2-6-pro"
+        | "xiaomi-mimo-v2.6-pro"
+        | "xiaomi-mimo-v2-6-pro"
+        | "mimo-v2.5-pro"
         | "mimo-v2-5-pro"
         | "xiaomi-mimo-v2.5-pro"
         | "xiaomi-mimo-v2-5-pro" => Some(DEFAULT_XIAOMI_MIMO_MODEL),
@@ -4363,7 +4353,11 @@ fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {
         | "xiaomi-mimo-v2-5-pro-ultraspeed"
         | "ultraspeed"
         | "pro-ultraspeed" => Some(XIAOMI_MIMO_V2_5_PRO_ULTRASPEED_MODEL),
-        "omni"
+        XIAOMI_MIMO_V2_6_FLASH_MODEL
+        | "mimo-v2-6-flash"
+        | "xiaomi-mimo-v2.6-flash"
+        | "xiaomi-mimo-v2-6-flash"
+        | "omni"
         | "mimo-omni"
         | "v2.5-omni"
         | "v25-omni"
@@ -4376,7 +4370,7 @@ fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {
         | "xiaomi-mimo-v2.5"
         | "xiaomi-mimo-v2-5"
         | "xiaomi-mimo-v2.5-omni"
-        | "xiaomi-mimo-v2-5-omni" => Some(XIAOMI_MIMO_V2_5_OMNI_MODEL),
+        | "xiaomi-mimo-v2-5-omni" => Some(XIAOMI_MIMO_V2_6_FLASH_MODEL),
         "asr" | "mimo-asr" | "mimo-v2.5-asr" | "speech-to-text" | "transcribe" => {
             Some(XIAOMI_MIMO_ASR_MODEL)
         }
@@ -4572,117 +4566,11 @@ fn canonical_orcarouter_recent_model_id(model: &str) -> Option<&'static str> {
 }
 
 fn default_model_for_provider(provider: ProviderKind) -> &'static str {
-    match provider {
-        ProviderKind::Deepseek => DEFAULT_DEEPSEEK_MODEL,
-        ProviderKind::DeepseekAnthropic => DEFAULT_DEEPSEEK_ANTHROPIC_MODEL,
-        ProviderKind::NvidiaNim => DEFAULT_NVIDIA_NIM_MODEL,
-        ProviderKind::Openai => DEFAULT_OPENAI_MODEL,
-        ProviderKind::Atlascloud => DEFAULT_ATLASCLOUD_MODEL,
-        ProviderKind::WanjieArk => DEFAULT_WANJIE_ARK_MODEL,
-        ProviderKind::Volcengine => DEFAULT_VOLCENGINE_MODEL,
-        ProviderKind::Openrouter => DEFAULT_OPENROUTER_MODEL,
-        ProviderKind::Orcarouter => DEFAULT_ORCAROUTER_MODEL,
-        ProviderKind::XiaomiMimo => DEFAULT_XIAOMI_MIMO_MODEL,
-        ProviderKind::Novita => DEFAULT_NOVITA_MODEL,
-        ProviderKind::Fireworks => DEFAULT_FIREWORKS_MODEL,
-        ProviderKind::Siliconflow | ProviderKind::SiliconflowCN => DEFAULT_SILICONFLOW_MODEL,
-        ProviderKind::Arcee => DEFAULT_ARCEE_MODEL,
-        ProviderKind::Moonshot => DEFAULT_MOONSHOT_MODEL,
-        ProviderKind::Sglang => DEFAULT_SGLANG_MODEL,
-        ProviderKind::Vllm => DEFAULT_VLLM_MODEL,
-        ProviderKind::Ollama => DEFAULT_OLLAMA_MODEL,
-        ProviderKind::OllamaCloud => DEFAULT_OLLAMA_CLOUD_MODEL,
-        ProviderKind::Huggingface => DEFAULT_HUGGINGFACE_MODEL,
-        ProviderKind::Modelscope => DEFAULT_MODELSCOPE_MODEL,
-        ProviderKind::Together => DEFAULT_TOGETHER_MODEL,
-        ProviderKind::Qianfan => DEFAULT_QIANFAN_MODEL,
-        ProviderKind::OpenaiCodex => DEFAULT_OPENAI_CODEX_MODEL,
-        ProviderKind::Anthropic => DEFAULT_ANTHROPIC_MODEL,
-        ProviderKind::Openmodel => DEFAULT_OPENMODEL_MODEL,
-        ProviderKind::Zai => DEFAULT_ZAI_MODEL,
-        ProviderKind::Stepfun => DEFAULT_STEPFUN_MODEL,
-        ProviderKind::Minimax | ProviderKind::MinimaxAnthropic => DEFAULT_MINIMAX_MODEL,
-        ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_MODEL,
-        ProviderKind::Sakana => DEFAULT_SAKANA_MODEL,
-        ProviderKind::LongCat => DEFAULT_LONGCAT_MODEL,
-        ProviderKind::OpencodeGo => DEFAULT_OPENCODE_GO_MODEL,
-        ProviderKind::OpencodeZen => DEFAULT_OPENCODE_ZEN_MODEL,
-        ProviderKind::Meta => DEFAULT_META_MODEL,
-        ProviderKind::Xai => DEFAULT_XAI_MODEL,
-        ProviderKind::Mistral => DEFAULT_MISTRAL_MODEL,
-        ProviderKind::Google => DEFAULT_GOOGLE_MODEL,
-        ProviderKind::Antigravity => DEFAULT_ANTIGRAVITY_MODEL,
-        ProviderKind::Telecomjs => DEFAULT_TELECOMJS_MODEL,
-        ProviderKind::Edenai => DEFAULT_EDENAI_MODEL,
-        ProviderKind::Zenmux => DEFAULT_ZENMUX_MODEL,
-        ProviderKind::Csdn => DEFAULT_CSDN_MODEL,
-        ProviderKind::Concentrate => DEFAULT_CONCENTRATE_MODEL,
-        ProviderKind::Codewhale => DEFAULT_CODEWHALE_MODEL,
-        ProviderKind::ModelstudioTokenPlan
-        | ProviderKind::ModelstudioTokenPlanAnthropic
-        | ProviderKind::ModelstudioCodingPlan
-        | ProviderKind::ModelstudioCodingPlanAnthropic => DEFAULT_MODELSTUDIO_TOKEN_PLAN_MODEL,
-        // No built-in default model; the registry placeholder keeps this total.
-        ProviderKind::Custom => provider.provider().default_model(),
-    }
+    provider.provider().default_model()
 }
 
 fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
-    match provider {
-        ProviderKind::Deepseek => DEFAULT_DEEPSEEK_BASE_URL,
-        ProviderKind::DeepseekAnthropic => DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL,
-        ProviderKind::NvidiaNim => DEFAULT_NVIDIA_NIM_BASE_URL,
-        ProviderKind::Openai => DEFAULT_OPENAI_BASE_URL,
-        ProviderKind::Atlascloud => DEFAULT_ATLASCLOUD_BASE_URL,
-        ProviderKind::WanjieArk => DEFAULT_WANJIE_ARK_BASE_URL,
-        ProviderKind::Volcengine => DEFAULT_VOLCENGINE_BASE_URL,
-        ProviderKind::Openrouter => DEFAULT_OPENROUTER_BASE_URL,
-        ProviderKind::Orcarouter => DEFAULT_ORCAROUTER_BASE_URL,
-        ProviderKind::XiaomiMimo => DEFAULT_XIAOMI_MIMO_BASE_URL,
-        ProviderKind::Novita => DEFAULT_NOVITA_BASE_URL,
-        ProviderKind::Fireworks => DEFAULT_FIREWORKS_BASE_URL,
-        ProviderKind::Siliconflow => DEFAULT_SILICONFLOW_BASE_URL,
-        ProviderKind::SiliconflowCN => DEFAULT_SILICONFLOW_CN_BASE_URL,
-        ProviderKind::Arcee => DEFAULT_ARCEE_BASE_URL,
-        ProviderKind::Moonshot => DEFAULT_MOONSHOT_BASE_URL,
-        ProviderKind::Sglang => DEFAULT_SGLANG_BASE_URL,
-        ProviderKind::Vllm => DEFAULT_VLLM_BASE_URL,
-        ProviderKind::Ollama => DEFAULT_OLLAMA_BASE_URL,
-        ProviderKind::OllamaCloud => DEFAULT_OLLAMA_CLOUD_BASE_URL,
-        ProviderKind::Huggingface => DEFAULT_HUGGINGFACE_BASE_URL,
-        ProviderKind::Modelscope => DEFAULT_MODELSCOPE_BASE_URL,
-        ProviderKind::Together => DEFAULT_TOGETHER_BASE_URL,
-        ProviderKind::Qianfan => DEFAULT_QIANFAN_BASE_URL,
-        ProviderKind::OpenaiCodex => DEFAULT_OPENAI_CODEX_BASE_URL,
-        ProviderKind::Anthropic => DEFAULT_ANTHROPIC_BASE_URL,
-        ProviderKind::Openmodel => DEFAULT_OPENMODEL_BASE_URL,
-        ProviderKind::Zai => DEFAULT_ZAI_BASE_URL,
-        ProviderKind::Stepfun => DEFAULT_STEPFUN_BASE_URL,
-        ProviderKind::Minimax => DEFAULT_MINIMAX_BASE_URL,
-        ProviderKind::MinimaxAnthropic => DEFAULT_MINIMAX_ANTHROPIC_BASE_URL,
-        ProviderKind::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL,
-        ProviderKind::Sakana => DEFAULT_SAKANA_BASE_URL,
-        ProviderKind::LongCat => DEFAULT_LONGCAT_BASE_URL,
-        ProviderKind::OpencodeGo => DEFAULT_OPENCODE_GO_BASE_URL,
-        ProviderKind::OpencodeZen => DEFAULT_OPENCODE_ZEN_BASE_URL,
-        ProviderKind::Meta => DEFAULT_META_BASE_URL,
-        ProviderKind::Xai => DEFAULT_XAI_BASE_URL,
-        ProviderKind::Mistral => DEFAULT_MISTRAL_BASE_URL,
-        ProviderKind::Google => DEFAULT_GOOGLE_BASE_URL,
-        ProviderKind::Antigravity => DEFAULT_ANTIGRAVITY_BASE_URL,
-        ProviderKind::Telecomjs => DEFAULT_TELECOMJS_BASE_URL,
-        ProviderKind::Edenai => DEFAULT_EDENAI_BASE_URL,
-        ProviderKind::Zenmux => DEFAULT_ZENMUX_BASE_URL,
-        ProviderKind::Csdn => DEFAULT_CSDN_BASE_URL,
-        ProviderKind::Concentrate => DEFAULT_CONCENTRATE_BASE_URL,
-        ProviderKind::Codewhale => DEFAULT_CODEWHALE_BASE_URL,
-        ProviderKind::ModelstudioTokenPlan => DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL,
-        ProviderKind::ModelstudioTokenPlanAnthropic => MODELSTUDIO_TOKEN_PLAN_ANTHROPIC_BASE_URL,
-        ProviderKind::ModelstudioCodingPlan => DEFAULT_MODELSTUDIO_CODING_PLAN_BASE_URL,
-        ProviderKind::ModelstudioCodingPlanAnthropic => MODELSTUDIO_CODING_PLAN_ANTHROPIC_BASE_URL,
-        // No built-in default base URL; the registry placeholder keeps this total.
-        ProviderKind::Custom => provider.provider().default_base_url(),
-    }
+    provider.provider().default_base_url()
 }
 
 fn moonshot_base_url_uses_kimi_code(base_url: &str) -> bool {
@@ -4703,19 +4591,7 @@ fn wire_prefers_anthropic(kind: ProviderKind, wire: Option<&str>) -> bool {
     ) {
         return true;
     }
-    let Some(raw) = wire.map(str::trim).filter(|value| !value.is_empty()) else {
-        return false;
-    };
-    let normalized = raw.to_ascii_lowercase().replace(['_', ' '], "-");
-    matches!(
-        normalized.as_str(),
-        "anthropic"
-            | "anthropic-messages"
-            | "messages"
-            | "claude"
-            | "anthropic-compatible"
-            | "anthropic-compat"
-    )
+    provider::wire_dialect_prefers_anthropic(wire)
 }
 
 fn modelstudio_mode_is_coding_plan(kind: ProviderKind, mode: Option<&str>) -> bool {
@@ -6426,6 +6302,16 @@ pub fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     default_config_path()
 }
 
+pub fn require_explicit_config_exists(explicit: Option<PathBuf>) -> Result<()> {
+    if let Some(path) = explicit {
+        let path = normalize_config_file_path(path)?;
+        if !checked_path_exists(&path)? {
+            bail!("config file does not exist: {}", quote_os_path(&path));
+        }
+    }
+    Ok(())
+}
+
 /// Whether `path` names a workspace-scoped config document —
 /// `<repo>/.codewhale/config.toml` (or the legacy `.deepseek` layout) inside a
 /// checkout — rather than a user-global config file.
@@ -6984,6 +6870,10 @@ pub fn migrate_config_if_needed() -> Result<Option<ConfigMigration>> {
         return Ok(None);
     }
     let primary = codewhale_home()?.join(CONFIG_FILE_NAME);
+    // `exists()` follows links, so a dangling link would read as "absent" and
+    // the copy below would create whatever it points at. A link at the primary
+    // name is refused instead, dangling or not.
+    reject_path_symlink(&primary)?;
     if primary.exists() {
         return Ok(None);
     }
@@ -6991,11 +6881,10 @@ pub fn migrate_config_if_needed() -> Result<Option<ConfigMigration>> {
     if !legacy.exists() {
         return Ok(None);
     }
-    // Copy the config to the new home.
-    if let Some(parent) = primary.parent() {
-        std::fs::create_dir_all(parent).context("failed to create codewhale config directory")?;
-    }
-    std::fs::copy(&legacy, &primary)
+    // Copy the config to the new home, owner-only, through a temporary file
+    // renamed into place (the primary name is replaced, never written through).
+    let contents = std::fs::read(&legacy).context("failed to read legacy deepseek config")?;
+    persistence::atomic_write(&primary, &contents)
         .context("failed to migrate config from deepseek to codewhale home")?;
     tracing::info!(
         "Migrated config from {} to {}",

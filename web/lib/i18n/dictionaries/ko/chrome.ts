@@ -23,6 +23,7 @@ export const chrome: ChromeDict = {
   navCommunity: "커뮤니티",
   navContribute: "기여",
 
+  navFeatures: "기능",
   navProduct: "제품",
   navModels: "모델",
   navPlugins: "플러그인",
@@ -33,8 +34,6 @@ export const chrome: ChromeDict = {
   navHomeAria: "Codewhale 홈",
 
   installCta: "설치 →",
-
-  authSignIn: "로그인",
 
   dateLocale: "ko-KR",
 
@@ -48,7 +47,7 @@ export const chrome: ChromeDict = {
   themeTitle: "테마 · 자동 / 밝게 / 어둡게",
 
   footerTagline:
-    "원하는 모델로 만들고 싶은 것을 구현하고 일상적인 작업을 자동화하세요.",
+    "터미널과 원하는 모델로 사용하는 오픈 소스 코딩 에이전트.",
   footerProduct: "제품",
   footerProject: "프로젝트",
   footerDocs: "문서",

@@ -9,10 +9,11 @@
 //! # Platform Support
 //!
 //! - **macOS**: Uses Seatbelt (`sandbox-exec`) when the runtime probe succeeds
-//! - **Linux**: Uses bubblewrap only when the user opts in and `/usr/bin/bwrap`
-//!   is executable. The seccomp helper is not wired into child execution and
-//!   therefore is not advertised. The extension host is the exception to the
-//!   opt-in: it uses bubblewrap whenever a probe shows it works
+//! - **Linux**: Uses bubblewrap by default whenever `/usr/bin/bwrap` is
+//!   installed and a probe shows it can create its namespaces; `prefer_bwrap
+//!   = false` opts out. The seccomp helper is not wired into child execution
+//!   and therefore is not advertised. The extension host uses bubblewrap on
+//!   the same condition, probed per launch
 //!   (`extension_host::supervisor::plan_launch`).
 //! - **OpenHarmony**: No local Linux sandbox is advertised. Bubblewrap,
 //!   seccomp, and Linux `prctl` hardening are gated out under `target_env =
@@ -67,7 +68,7 @@ pub use policy::SandboxPolicy;
 // renaming it silently breaks that gate.
 pub const PUBLIC_SANDBOX_BACKENDS: &[&str] = &[
     "seatbelt (macOS, when available)",
-    "bubblewrap (Linux, opt-in when installed)",
+    "bubblewrap (Linux, default when installed and working)",
 ];
 
 /// Specification for a command to be executed, potentially within a sandbox.
@@ -173,14 +174,19 @@ impl CommandSpec {
         self
     }
 
-    /// Add environment variables for this command.
+    /// Add environment variables without discarding shell defaults.
     pub fn with_env(mut self, env: HashMap<String, String>) -> Self {
-        self.env = env;
+        for (key, value) in env {
+            self = self.with_env_var(&key, &value);
+        }
         self
     }
 
     /// Add a single environment variable.
     pub fn with_env_var(mut self, key: &str, value: &str) -> Self {
+        #[cfg(windows)]
+        self.env
+            .retain(|existing, _| !existing.eq_ignore_ascii_case(key));
         self.env.insert(key.to_string(), value.to_string());
         self
     }
@@ -331,6 +337,64 @@ impl ExecEnv {
         }
     }
 
+    pub fn spawn_background(
+        &self,
+        mut command: std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        if self.sandbox_type == SandboxType::LinuxBubblewrap {
+            return bwrap::spawn(move || command.spawn())?;
+        }
+        command.spawn()
+    }
+
+    #[cfg(not(target_env = "ohos"))]
+    pub fn spawn_pty(
+        &self,
+        slave: Box<dyn portable_pty::SlavePty + Send>,
+        cwd: &std::path::Path,
+    ) -> anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>> {
+        let mut command = portable_pty::CommandBuilder::new(self.program());
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        if self.sandbox_type == SandboxType::LinuxBubblewrap {
+            anyhow::ensure!(
+                self.program() == bwrap::BWRAP_PATH,
+                "sandboxed PTY requires the configured bubblewrap wrapper"
+            );
+            let args = self.args();
+            let separator = args
+                .iter()
+                .position(|arg| arg == "--")
+                .filter(|index| index + 1 < args.len())
+                .ok_or_else(|| anyhow::anyhow!("sandboxed PTY command is missing its target"))?;
+            let setsid = ["/usr/bin/setsid", "/bin/setsid"]
+                .into_iter()
+                .find(|path| bwrap::is_executable(std::path::Path::new(path)))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("sandboxed PTY requires util-linux setsid; install util-linux")
+                })?;
+            command.args(&args[..=separator]);
+            command.args([setsid, "--ctty", "--wait", "--"]);
+            command.args(&args[separator + 1..]);
+            command.set_controlling_tty(false);
+        } else {
+            command.args(self.args());
+        }
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+        command.args(self.args());
+        command.cwd(cwd);
+        crate::child_env::apply_to_pty_command(
+            &mut command,
+            crate::child_env::string_map_env(&self.env),
+        );
+        let launch = move || slave.spawn_command(command);
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        if self.sandbox_type == SandboxType::LinuxBubblewrap {
+            return bwrap::spawn(launch)?;
+        }
+        launch()
+    }
+
     /// Check if this execution is sandboxed.
     pub fn is_sandboxed(&self) -> bool {
         !matches!(self.sandbox_type, SandboxType::None)
@@ -344,8 +408,11 @@ pub fn get_platform_sandbox() -> Option<SandboxType> {
 
 /// Detect the sandbox wrapper the configured command path can actually use.
 ///
-/// Linux bubblewrap is deliberately opt-in. Source-only sandbox prototypes do
-/// not make commands sandboxed unless the child launch path applies them.
+/// Linux bubblewrap is on by default via `Config::prefers_bwrap` (an
+/// explicit `prefer_bwrap = false` opts out) and only selected when a real
+/// wrapped probe run proves it works on this host. Source-only sandbox
+/// prototypes do not make commands sandboxed unless the child launch path
+/// applies them.
 pub fn get_platform_sandbox_with_bwrap_preference(prefer_bwrap: bool) -> Option<SandboxType> {
     #[cfg(target_os = "macos")]
     {
@@ -377,6 +444,13 @@ pub fn get_platform_sandbox_with_bwrap_preference(prefer_bwrap: bool) -> Option<
 /// Check if sandboxing is available on this platform.
 pub fn is_sandbox_available() -> bool {
     get_platform_sandbox().is_some()
+}
+
+pub fn bwrap_setup_failure(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .map(str::trim_start)
+        .find(|line| line.starts_with("bwrap:"))
 }
 
 /// Manager for sandbox operations.
@@ -460,20 +534,21 @@ fn expand_home_prefix(path: PathBuf) -> PathBuf {
     path
 }
 
-/// The bubblewrap arguments that hide `path` from a sandboxed command: an
-/// empty tmpfs over an existing directory, `/dev/null` bound over an existing
-/// file, nothing for a path that does not exist (there is nothing to deny).
-/// Blocking. Platform-neutral so it is exercised on every host; only the
-/// Linux bwrap builder emits it.
+/// The bubblewrap arguments that hide `path` from a sandboxed command, aimed
+/// at its resolved location because bubblewrap cannot mount through a
+/// symlink: an empty tmpfs over an existing directory, `/dev/null` bound over
+/// an existing file, nothing for a path that does not exist (there is nothing
+/// to deny). Blocking. Platform-neutral so it is exercised on every host; only
+/// the Linux bwrap builder emits it.
 fn bwrap_mask_args(path: &std::path::Path) -> Vec<String> {
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Ok(resolved) = std::fs::canonicalize(path) else {
         return Vec::new();
     };
-    let path = path.to_string_lossy().into_owned();
-    if meta.is_dir() {
-        vec!["--tmpfs".to_string(), path]
+    let spelled = resolved.to_string_lossy().into_owned();
+    if resolved.is_dir() {
+        vec!["--tmpfs".to_string(), spelled]
     } else {
-        vec!["--ro-bind".to_string(), "/dev/null".to_string(), path]
+        vec!["--ro-bind".to_string(), "/dev/null".to_string(), spelled]
     }
 }
 
@@ -870,11 +945,7 @@ impl SandboxManager {
 
             #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             SandboxType::LinuxBubblewrap => {
-                if let Some(error) = stderr
-                    .lines()
-                    .map(str::trim_start)
-                    .find(|line| line.starts_with("bwrap:"))
-                {
+                if let Some(error) = bwrap_setup_failure(stderr) {
                     format!("Bubblewrap could not create the sandbox: {}", error)
                 } else if stderr.contains("Read-only file system") {
                     "Bubblewrap blocked access outside the writable workspace view.".to_string()
@@ -1056,13 +1127,36 @@ mod tests {
     #[test]
     fn test_command_spec_builder() {
         let spec = CommandSpec::shell("test", PathBuf::from("."), Duration::from_secs(10))
-            .with_policy(SandboxPolicy::ReadOnly)
+            .with_policy(SandboxPolicy::read_only())
             .with_env_var("FOO", "bar")
             .with_justification("Testing");
 
-        assert!(matches!(spec.sandbox_policy, SandboxPolicy::ReadOnly));
+        assert!(matches!(
+            spec.sandbox_policy,
+            SandboxPolicy::ReadOnly { .. }
+        ));
         assert_eq!(spec.env.get("FOO"), Some(&"bar".to_string()));
         assert_eq!(spec.justification, Some("Testing".to_string()));
+
+        let spec = spec
+            .with_env(HashMap::new())
+            .with_env(HashMap::from([("SECOND".to_string(), "added".to_string())]));
+        assert_eq!(spec.env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(spec.env.get("SECOND").map(String::as_str), Some("added"));
+        let spec = spec.with_env(HashMap::from([("FOO".to_string(), "override".to_string())]));
+        assert_eq!(spec.env.get("FOO").map(String::as_str), Some("override"));
+        #[cfg(windows)]
+        {
+            let spec = spec.with_env(HashMap::from([(
+                "foo".to_string(),
+                "lowercase".to_string(),
+            )]));
+            assert!(!spec.env.contains_key("FOO"));
+            assert_eq!(spec.env.get("foo").map(String::as_str), Some("lowercase"));
+            let spec = spec.with_env_var("FOO", "uppercase");
+            assert!(!spec.env.contains_key("foo"));
+            assert_eq!(spec.env.get("FOO").map(String::as_str), Some("uppercase"));
+        }
     }
 
     #[test]
@@ -1309,6 +1403,78 @@ mod tests {
         let _ = env;
     }
 
+    /// Real Linux enforcement proof, not a marker check: the same
+    /// outside-workspace write succeeds unsandboxed and fails under
+    /// bubblewrap, and a normal workspace write succeeds inside the wrapper.
+    /// Skips on hosts where the functional probe says bwrap cannot run.
+    #[test]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn bwrap_workspace_write_blocks_outside_write_allows_inside() {
+        if !bwrap::is_available() {
+            return;
+        }
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let outside = tempfile::Builder::new()
+            .prefix("cw_bwrap_outside")
+            .tempdir_in(&home)
+            .expect("outside-workspace tempdir under HOME");
+        let outside_target = outside.path().join("must_not_persist");
+        let inside_target = workspace.path().join("allowed_write");
+
+        let run = |manager: &SandboxManager, command: &str| -> (SandboxType, bool) {
+            let spec = CommandSpec::shell(
+                command,
+                workspace.path().to_path_buf(),
+                Duration::from_secs(15),
+            )
+            // CI's hermetic HOME lives under /tmp. Exclude temporary roots so
+            // the outside fixture is outside this test's writable policy too.
+            .with_policy(SandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![],
+                network_access: false,
+                exclude_tmpdir: true,
+                exclude_slash_tmp: true,
+            });
+            let env = manager.prepare(&spec);
+            let (program, args) = env.command.split_first().unwrap();
+            let status = std::process::Command::new(program)
+                .args(args)
+                .current_dir(&env.cwd)
+                .envs(&env.env)
+                .status()
+                .expect("spawn prepared command");
+            (env.sandbox_type, status.success())
+        };
+
+        // Control: without the wrapper the outside write lands on the host —
+        // this proves the command itself is permitted and only the sandbox
+        // confines it.
+        let unwrapped = SandboxManager::default();
+        let (kind, ok) = run(
+            &unwrapped,
+            &format!("echo x > {}", outside_target.display()),
+        );
+        assert_eq!(kind, SandboxType::None);
+        assert!(ok);
+        assert!(outside_target.exists());
+        std::fs::remove_file(&outside_target).unwrap();
+
+        let wrapped = SandboxManager::with_bwrap_preference(true);
+        let (kind, ok) = run(&wrapped, &format!("echo x > {}", outside_target.display()));
+        assert_eq!(kind, SandboxType::LinuxBubblewrap);
+        assert!(!ok);
+        assert!(!outside_target.exists());
+
+        let (kind, ok) = run(&wrapped, &format!("echo ok > {}", inside_target.display()));
+        assert_eq!(kind, SandboxType::LinuxBubblewrap);
+        assert!(ok);
+        assert_eq!(
+            std::fs::read_to_string(&inside_target).unwrap().trim(),
+            "ok"
+        );
+    }
+
     #[test]
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     fn bwrap_read_only_policy_keeps_the_working_directory_read_only() {
@@ -1317,7 +1483,7 @@ mod tests {
             ..SandboxManager::default()
         };
         let spec = CommandSpec::shell("true", PathBuf::from("/tmp"), Duration::from_secs(5))
-            .with_policy(SandboxPolicy::ReadOnly);
+            .with_policy(SandboxPolicy::read_only());
         let env = manager.prepare(&spec);
 
         assert_eq!(env.sandbox_type, SandboxType::LinuxBubblewrap);
@@ -1388,7 +1554,7 @@ mod tests {
         let manager = SandboxManager::new();
         let policies = [
             SandboxPolicy::DangerFullAccess,
-            SandboxPolicy::ReadOnly,
+            SandboxPolicy::read_only(),
             SandboxPolicy::workspace_with_network(),
             SandboxPolicy::default(),
         ];

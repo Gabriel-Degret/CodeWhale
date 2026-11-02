@@ -71,11 +71,11 @@ pub(crate) fn tool_snapshot(
                 step_budget_source: terminal.step_budget_source.to_string(),
                 model_step_index: terminal.model_step_index,
                 model_requests_started: terminal.model_requests_started,
+                transport_retries: terminal.transport_retries,
                 transparent_stream_retries: terminal.transparent_stream_retries,
                 stream_resumes: terminal.stream_resumes,
                 reasoning_only_reprompts: terminal.reasoning_only_reprompts,
                 empty_stop_retries: terminal.empty_stop_retries,
-                soft_landing_sent: terminal.soft_landing_sent,
                 final_report_requested: terminal.final_report_requested,
                 permission_strategy_switches: terminal.permission_strategy_switches,
                 permission_denial_rounds_without_progress: terminal

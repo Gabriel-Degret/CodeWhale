@@ -16,7 +16,7 @@ fn app(temp: &TempDir) -> App {
         memory_path: temp.path().join("memory.md"),
         notes_path: temp.path().join("notes.txt"),
         mcp_config_path: temp.path().join("mcp.json"),
-        ..crate::test_support::test_tui_options(temp.path())
+        ..crate::tui::test_support::test_tui_options(temp.path())
     };
     let mut app = App::new(options, &Config::default());
     app.ui_locale = Locale::En;
@@ -71,6 +71,7 @@ fn seed(app: &mut App) {
                     thinking: "hidden reasoning".into(),
                     signature: Some("hidden-signature".into()),
                     state: None,
+                    redacted_data: None,
                 },
                 call("first-call"),
                 result("first-result", Some(false)),
@@ -366,7 +367,27 @@ fn structcopy_host_exposes_exact_authority_and_filters_private_data_before_cross
         debug_diff,
         debug_undo,
         debug_diagnostics,
+        permissions,
+        config_status,
+        config,
+        pet,
+        trust,
+        login,
+        work_surface,
+        navigation,
+        voice_input,
     } = bundle.contexts(capabilities).into_parts();
+    assert!(
+        permissions.is_none()
+            && config_status.is_none()
+            && config.is_none()
+            && pet.is_none()
+            && trust.is_none()
+            && login.is_none()
+            && work_surface.is_none()
+            && navigation.is_none()
+            && voice_input.is_none()
+    );
     assert!(presentation.is_some());
     assert!(
         session.is_none()

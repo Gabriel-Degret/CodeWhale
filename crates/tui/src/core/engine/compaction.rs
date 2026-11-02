@@ -34,11 +34,27 @@ pub(super) enum AutoCompactionStep {
 #[derive(Debug)]
 struct EngineCompactionNoticeSink {
     tx: mpsc::Sender<Event>,
+    child: Option<Arc<crate::tools::subagent::engine::ChildAuthority>>,
 }
 
 impl crate::compaction::CompactionNoticeSink for EngineCompactionNoticeSink {
     fn notice(&self, message: String) {
         let _ = self.tx.try_send(Event::Status { message });
+    }
+    fn accounting_origin(&self) -> Option<(crate::cost_status::CostScopeToken, String, String)> {
+        self.child.as_ref().map(|child| child.accounting_origin())
+    }
+    fn settled_usage<'a>(
+        &'a self,
+        source: &'a str,
+        route: &'a crate::cost_status::EffectiveRouteEnvelope,
+        usage: &'a Usage,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(child) = self.child.as_ref() {
+                child.project_settled_response(source, route, usage).await;
+            }
+        })
     }
 }
 
@@ -113,7 +129,11 @@ impl Engine {
         details["session_id"] = serde_json::json!(self.session.id);
         details["thread_id"] = serde_json::json!(self.config.runtime_services.active_thread_id);
         details["model"] = serde_json::json!(self.config.model);
+        #[cfg(test)]
+        let env_ticket = crate::test_support::env_scope_ticket();
         if let Err(error) = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
             crate::audit::log_sensitive_event(event, details);
         })
         .await
@@ -199,6 +219,26 @@ impl Engine {
         ))
     }
 
+    fn learn_summary_image_cap(
+        &mut self,
+        prepared: &PreparedCompactionEnvelope,
+        err: &anyhow::Error,
+    ) -> Option<usize> {
+        let rejection =
+            crate::llm_client::image_count_rejection(&format!("{err:#}").to_lowercase())?;
+        let mut messages = self.session.messages.to_vec();
+        crate::image_attach::strip_images_when_unsupported(
+            &mut messages,
+            prepared.config.image_input,
+            &prepared.config.model,
+        );
+        if let Some(cap) = prepared.image_cap {
+            crate::image_attach::cap_request_images(&mut messages, cap);
+        }
+        let sent = crate::image_attach::count_request_images(&messages);
+        self.learn_image_cap(&prepared.config.model, sent, rejection)
+    }
+
     pub(super) fn prepare_compaction_envelope(
         &self,
         mut config: CompactionConfig,
@@ -208,10 +248,21 @@ impl Engine {
         config
             .workspace
             .get_or_insert_with(|| self.config.workspace.clone());
+        let (image_input, image_cap) = self.request_image_policy(
+            &self.image_route_provider_key(),
+            &config.model,
+            config.image_input,
+        );
+        config.image_input = image_input;
         let mut prepared = PreparedCompactionEnvelope::new(config);
+        prepared.image_cap = image_cap;
         prepared.session_id = Some(self.session.id.clone());
         prepared.notice_sink = Some(std::sync::Arc::new(EngineCompactionNoticeSink {
             tx: self.tx_event.clone(),
+            child: self
+                .child_host
+                .as_ref()
+                .map(|child| child.authority.clone()),
         }));
         // The summary request must carry the reasoning tier the turn sends:
         // reasoning routes render it at the head of the prompt, so omitting
@@ -231,6 +282,9 @@ impl Engine {
         route: ResolvedRuntimeRoute,
         compaction: CompactionConfig,
     ) {
+        // Manual compaction terminals identify the compaction operation, never
+        // a surrounding host submission or a model turn.
+        let compaction_id = Some(id.clone());
         self.emit_compaction_started(id.clone(), false, "Making room…".to_string())
             .await;
         let Some(cancel_token) = self.claim_compaction(&id) else {
@@ -238,6 +292,9 @@ impl Engine {
             self.emit_compaction_cancelled(id, false, message).await;
             let _ = self
                 .send_event(Event::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id,
                     usage: Usage::default(),
                     parent_route_usage: Usage::default(),
                     routed_usage_dropped_records: 0,
@@ -256,7 +313,23 @@ impl Engine {
             self.emit_compaction_failed(id, false, message.clone())
                 .await;
             let _ = self
-                .send_event(Event::error(ErrorEnvelope::fatal_auth(message)))
+                .send_event(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
+                .await;
+            // Route rejection is still a terminal for the compaction
+            // operation: hosts waiting on its lifecycle must be released.
+            let _ = self
+                .send_event(Event::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id,
+                    usage: Usage::default(),
+                    parent_route_usage: Usage::default(),
+                    routed_usage_dropped_records: 0,
+                    status: TurnOutcomeStatus::Failed,
+                    error: Some(message),
+                    tool_catalog: None,
+                    base_url: None,
+                })
                 .await;
             return;
         }
@@ -283,6 +356,9 @@ impl Engine {
         id: String,
         cancel_token: CancellationToken,
     ) {
+        // Manual compaction terminals identify the compaction operation, never
+        // a surrounding host submission or a model turn.
+        let compaction_id = Some(id.clone());
         let zero_usage = Usage {
             input_tokens: 0,
             output_tokens: 0,
@@ -298,6 +374,9 @@ impl Engine {
                 .await;
             let _ = self
                 .send_event(Event::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id,
                     usage: zero_usage,
                     parent_route_usage: Usage::default(),
                     routed_usage_dropped_records: 0,
@@ -334,7 +413,7 @@ impl Engine {
             ) => Some(result),
         };
         self.session.total_usage.add(&compaction_usage);
-        self.record_goal_usage_for_turn(&compaction_usage, started.elapsed());
+        self.record_goal_usage_for_turn(&compaction_usage, started);
         self.emit_compaction_usage(&compaction_usage, started.elapsed())
             .await;
 
@@ -348,6 +427,9 @@ impl Engine {
             .await;
             let _ = self
                 .send_event(Event::TurnComplete {
+                    turn_id: None,
+                    submission_id: None,
+                    compaction_id,
                     usage: compaction_usage,
                     parent_route_usage: Usage::default(),
                     routed_usage_dropped_records: 0,
@@ -375,6 +457,9 @@ impl Engine {
                         .await;
                         let _ = self
                             .send_event(Event::TurnComplete {
+                                turn_id: None,
+                                submission_id: None,
+                                compaction_id,
                                 usage: compaction_usage,
                                 parent_route_usage: Usage::default(),
                                 routed_usage_dropped_records: 0,
@@ -390,6 +475,15 @@ impl Engine {
                     let retries_used = result.retries_used;
                     let coverage_clause = result.coverage.receipt_clause();
                     let path = result.coverage.path;
+                    if let Some(job) = self.child_job()
+                        && let Err(error) = job
+                            .before_replace(&self.session.messages, &result.messages)
+                            .await
+                    {
+                        self.cancel_token.cancel();
+                        tracing::error!(%error, "child compaction projection failed; original Session retained");
+                        return;
+                    }
                     self.session.replace_messages(result.messages);
                     if let Some(pm) = self.session.prefix_stability.as_mut() {
                         pm.note_history_reset("compaction");
@@ -431,6 +525,7 @@ impl Engine {
                 }
             }
             Err(err) => {
+                self.learn_summary_image_cap(&prepared, &err);
                 let message = crate::compaction::report_compaction_failure(
                     "Making room failed",
                     &id,
@@ -449,6 +544,9 @@ impl Engine {
 
         let _ = self
             .send_event(Event::TurnComplete {
+                turn_id: None,
+                submission_id: None,
+                compaction_id,
                 usage: compaction_usage,
                 parent_route_usage: Usage::default(),
                 routed_usage_dropped_records: 0,
@@ -491,12 +589,12 @@ impl Engine {
             self.session.latest_parent_input_tokens,
         );
         let prepared = if !*auto_compaction_suppressed
-            && crate::compaction::compaction_pressure_reached_with_billed(
-                &self.session.messages,
-                self.session.system_prompt.as_ref(),
-                &auto_compaction_config,
-                billed_input_tokens,
-            ) {
+            && auto_compaction_config.enabled
+            && billed_input_tokens
+                .and_then(|tokens| usize::try_from(tokens).ok())
+                .unwrap_or(0)
+                >= auto_compaction_config.token_threshold
+        {
             let mut prepared = self.prepare_compaction_envelope(auto_compaction_config);
             prepared.tools = active_tools.map(<[Tool]>::to_vec);
             Some(prepared)
@@ -643,6 +741,16 @@ impl Engine {
                         let retries_used = result.retries_used;
                         let coverage_clause = result.coverage.receipt_clause();
                         let path = result.coverage.path;
+                        if let Some(job) = self.child_job()
+                            && let Err(error) = job
+                                .before_replace(&self.session.messages, &result.messages)
+                                .await
+                        {
+                            return AutoCompactionStep::EndTurn(
+                                TurnOutcomeStatus::Failed,
+                                Some(format!("child compaction projection failed: {error:#}")),
+                            );
+                        }
                         self.session.replace_messages(result.messages);
                         turn.clear_parent_input_tokens();
                         if let Some(pm) = self.session.prefix_stability.as_mut() {
@@ -693,6 +801,7 @@ impl Engine {
                 }
                 Err(err) => {
                     *auto_compaction_suppressed = true;
+                    self.learn_summary_image_cap(&prepared, &err);
                     // Log error but continue with original messages (never corrupt)
                     let message = crate::compaction::report_compaction_failure(
                         "Making room failed",
@@ -710,7 +819,7 @@ impl Engine {
             // turn's. Recheck the wall clock before it can authorize the
             // provider request that follows this phase.
             if let Some(error) = self.turn_wall_clock_exhausted_error() {
-                let _ = self.send_event(Event::status(error.clone())).await;
+                self.post_turn_budget_stop(&error).await;
                 return AutoCompactionStep::EndTurn(TurnOutcomeStatus::Failed, Some(error));
             }
         }
@@ -809,6 +918,15 @@ impl Engine {
         let result = match compaction_result {
             Ok(result) => result,
             Err(err) => {
+                if let Some(cap) = self.learn_summary_image_cap(&prepared, &err) {
+                    let message = format!(
+                        "Making room: {} refused the summary request's images; retrying with at most {cap} per request. Original conversation was preserved.",
+                        prepared.config.model
+                    );
+                    self.emit_compaction_failed(id.clone(), true, message).await;
+                    self.finish_compaction(&id);
+                    return true;
+                }
                 let message = if is_provider_rejection(&err) {
                     // The turn's error line carries the provider's answer;
                     // this receipt only closes the recovery attempt.
@@ -880,6 +998,15 @@ impl Engine {
         let recovered = after_tokens <= target_budget && after_tokens < before_tokens;
 
         if recovered {
+            if let Some(job) = self.child_job()
+                && let Err(error) = job
+                    .before_replace(&self.session.messages, &compacted_messages)
+                    .await
+            {
+                self.cancel_token.cancel();
+                tracing::error!(%error, "child recovery projection failed; original Session retained");
+                return false;
+            }
             self.session.replace_messages(compacted_messages);
             turn.clear_parent_input_tokens();
             if let Some(pm) = self.session.prefix_stability.as_mut() {
@@ -1000,7 +1127,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_notice_sink_delivers_a_status_event() {
         let (tx, mut rx) = mpsc::channel(4);
-        let sink = EngineCompactionNoticeSink { tx };
+        let sink = EngineCompactionNoticeSink { tx, child: None };
         sink.notice("Making room re-encoded 2 inline image(s)".to_string());
         match rx.recv().await {
             Some(Event::Status { message }) => {

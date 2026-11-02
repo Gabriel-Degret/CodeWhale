@@ -119,9 +119,9 @@ fn goal_status(
         return CommandResult::message(goal_usage());
     };
     let elapsed = if goal.time_used_seconds > 0 {
-        format_elapsed(goal.time_used_seconds)
+        codewhale_command_contract::elapsed::format_elapsed_secs(goal.time_used_seconds)
     } else if let Some(secs) = goal.started_at_elapsed_seconds {
-        format_elapsed(secs)
+        codewhale_command_contract::elapsed::format_elapsed_secs(secs)
     } else {
         "unknown".to_string()
     };
@@ -197,14 +197,13 @@ fn resume_goal(
         return CommandResult::error("No paused goal set. Use /goal <objective> first.");
     }
 
-    // Resuming an already-active goal is a no-op: the continuation loop is
-    // already running, and re-asserting Active could stack a second
-    // autonomous turn. Report progress instead.
     if effective_goal_status(goal) == ProjectGoalStatus::Active {
         if goal.pending_controls {
             return CommandResult::message(translate(presentation, "goal_control_accepted"));
         }
-        return goal_status(goal, presentation);
+        if goal.is_loading || goal.goal_continuation_waiting {
+            return goal_status(goal, presentation);
+        }
     }
 
     CommandResult::action(AppAction::SetGoalStatus {
@@ -246,16 +245,6 @@ fn goal_status_label(status: ProjectGoalStatus) -> &'static str {
         ProjectGoalStatus::Complete => "complete",
         ProjectGoalStatus::Paused => "paused",
         ProjectGoalStatus::Blocked => "blocked",
-    }
-}
-
-/// Format a whole-seconds duration (portable replica of the TUI leaf helper,
-/// byte-identical output; the contract never ships preformatted strings).
-fn format_elapsed(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else {
-        format!("{}m {:02}s", secs / 60, secs % 60)
     }
 }
 
@@ -515,19 +504,28 @@ mod tests {
     }
 
     #[test]
-    fn resume_on_an_active_goal_is_a_no_op_report() {
-        // Re-asserting Active while the loop is already running must not
-        // schedule a second autonomous turn.
+    fn resume_on_an_active_goal_only_kicks_when_idle() {
         let mut goal = goal_state();
         goal.objective = Some("Keep the build green".to_string());
         goal.status = ProjectGoalStatus::Active;
-        let resumed = run(&goal, Some("resume"));
-        assert!(!resumed.is_error);
-        assert!(
-            resumed.action.is_none(),
-            "no control op on already-active goal"
-        );
-        assert!(resumed.message.unwrap().contains("Keep the build green"));
+        for (is_loading, waiting) in [(false, false), (true, false), (false, true)] {
+            goal.is_loading = is_loading;
+            goal.goal_continuation_waiting = waiting;
+            let resumed = run(&goal, Some("resume"));
+            assert!(!resumed.is_error);
+            if is_loading || waiting {
+                assert!(resumed.action.is_none());
+                assert!(resumed.message.unwrap().contains("Keep the build green"));
+            } else {
+                assert!(matches!(
+                    resumed.action,
+                    Some(AppAction::SetGoalStatus {
+                        status: crate::tools::goal::GoalStatus::Active,
+                        clear: false
+                    })
+                ));
+            }
+        }
     }
 
     #[test]
@@ -587,19 +585,6 @@ mod tests {
                 .unwrap()
                 .contains("Command capability unavailable: presentation")
         );
-    }
-
-    #[test]
-    fn format_elapsed_matches_tui_leaf_helper() {
-        // The portable replica must stay byte-identical to the TUI elapsed
-        // helper (Phase 4 review recommendation).
-        for secs in [0, 1, 59, 60, 61, 125, 3599, 3600, 3601] {
-            assert_eq!(
-                format_elapsed(secs),
-                crate::elapsed::format_elapsed_secs(secs),
-                "format_elapsed({secs}) must equal the TUI helper"
-            );
-        }
     }
 
     #[test]

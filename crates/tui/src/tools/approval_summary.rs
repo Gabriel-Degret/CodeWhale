@@ -47,6 +47,37 @@ pub fn approval_summary_in(
         tr(locale, id).replace(&format!("{{{slot}}}"), value)
     };
 
+    let credential_uploads: Vec<_> =
+        crate::core::authority::auto_review::credential_upload_texts(tool_name, input)
+            .into_iter()
+            .filter_map(|(command, uploads)| {
+                let uploads: Vec<String> = uploads
+                    .into_iter()
+                    .filter(|upload| {
+                        upload != crate::core::authority::auto_review::UNPARSED_CREDENTIAL_UPLOAD
+                    })
+                    .collect();
+                (!uploads.is_empty()).then_some((command, uploads))
+            })
+            .collect();
+    if let Some((command, _)) = credential_uploads.first() {
+        let uploads: Vec<&str> = credential_uploads
+            .iter()
+            .flat_map(|(_, uploads)| uploads.iter().map(String::as_str))
+            .collect();
+        let uploads = code(&clip_to(&uploads.join(", "), MAX_QUOTED_CHARS / 2));
+        let template = tr(locale, MessageId::ApprovalSummaryUploadCredentials);
+        let (before, after) = template
+            .split_once("`{command}`")
+            .unwrap_or((&*template, ""));
+        return format!(
+            "{}{}{}",
+            before.replace("{credentials}", &uploads),
+            code(&clip_command(command, MAX_QUOTED_CHARS)),
+            after.replace("{credentials}", &uploads),
+        );
+    }
+
     match name {
         "exec_shell" | "task_shell_start" => match text("command") {
             Some(command) => run_command_summary(locale, command),
@@ -55,6 +86,9 @@ pub fn approval_summary_in(
         "exec_shell_wait" | "exec_wait" => msg(MessageId::ApprovalSummaryShellWait),
         "exec_shell_interact" | "exec_interact" => msg(MessageId::ApprovalSummaryShellInput),
         "exec_shell_cancel" => msg(MessageId::ApprovalSummaryShellStop),
+        "task_shell_wait" if crate::tools::tasks::task_shell_wait_requests_cancel(input) => {
+            msg(MessageId::ApprovalSummaryShellStop)
+        }
         "write_file" => match path("path") {
             Some(path) => with(MessageId::ApprovalSummaryWritePath, "path", &path),
             None => msg(MessageId::ApprovalSummaryWriteFile),
@@ -648,6 +682,26 @@ fn clip_command(value: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // The approval card for the model's stop call must say a command is being
+    // stopped, not show a bare tool name beside a task id.
+    #[test]
+    fn task_shell_wait_cancel_is_summarized_as_stopping_a_command() {
+        let stop = approval_summary_in(
+            Locale::En,
+            "task_shell_wait",
+            &json!({"task_id": "shell_1", "cancel": true}),
+            None,
+        );
+        assert_eq!(stop, "Stop a running shell command");
+        let poll = approval_summary_in(
+            Locale::En,
+            "task_shell_wait",
+            &json!({"task_id": "shell_1", "cancel": false, "gate": "test"}),
+            None,
+        );
+        assert_ne!(poll, stop);
+    }
 
     #[test]
     fn delegated_work_summary_names_the_authority_it_asks_for() {
