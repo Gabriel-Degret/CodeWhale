@@ -1136,9 +1136,9 @@
         let payload = r#"{
                 "object": "list",
                 "data": [
-                    {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek", "created": 1},
+                    {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek", "created": 1, "max_input_tokens": 262144, "max_output_tokens": 262144},
                     {"id": "deepseek-v4-flash", "object": "model"},
-                    {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek", "created": 1}
+                    {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek", "created": 1, "max_input_tokens": 262144, "max_output_tokens": 262144}
                 ]
             }"#;
 
@@ -1150,13 +1150,17 @@
                     id: "deepseek-v4-flash".to_string(),
                     owned_by: None,
                     created: None,
-                    display_name: None
+                    display_name: None,
+                    max_input_tokens: None,
+                    max_output_tokens: None
                 },
                 AvailableModel {
                     id: "deepseek-v4-pro".to_string(),
                     owned_by: Some("deepseek".to_string()),
                     created: Some(1),
-                    display_name: None
+                    display_name: None,
+                    max_input_tokens: Some(262_144),
+                    max_output_tokens: Some(262_144)
                 }
             ]
         );

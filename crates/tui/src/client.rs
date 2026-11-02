@@ -229,6 +229,14 @@ pub struct AvailableModel {
     pub created: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Token ceilings declared by the server's `/v1/models` roster, when the
+    /// OpenAI-compatible endpoint states them (vLLM and compatible gates
+    /// do). Preserved so the live CatalogOffering built from the roster
+    /// carries the server's own limits instead of dropping to the
+    /// conservative catalog-less fallback. Both optional: servers that never
+    /// state them keep `None`, exactly as before.
+    pub max_input_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
 }
 
 /// Request payload for Xiaomi MiMo speech synthesis models.
@@ -4828,6 +4836,10 @@ struct ModelListItem {
     owned_by: Option<String>,
     #[serde(default)]
     created: Option<u64>,
+    #[serde(default)]
+    max_input_tokens: Option<u64>,
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
 }
 
 /// OpenRouter `/models` response item with full capability metadata (#3385).
@@ -5048,6 +5060,8 @@ fn parse_models_response_for_provider(
                 display_name: Some(row.display_name),
                 owned_by: None,
                 created: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
             });
         }
     }
@@ -5066,6 +5080,8 @@ pub(crate) fn parse_models_response(payload: &str) -> Result<Vec<AvailableModel>
             owned_by: item.owned_by,
             created: item.created,
             display_name: None,
+            max_input_tokens: item.max_input_tokens,
+            max_output_tokens: item.max_output_tokens,
         })
         .collect::<Vec<_>>();
     models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -5387,7 +5403,14 @@ fn catalog_delta_from_models_body(
                 canonical_model: None,
                 default_for_provider: false,
                 family: None,
-                limit: None,
+                limit: match (model.max_input_tokens, model.max_output_tokens) {
+                    (None, None) => None,
+                    (input, output) => Some(codewhale_config::models_dev::ModelsDevLimit {
+                        context: input,
+                        input: None,
+                        output,
+                    }),
+                },
                 cost: None,
                 modalities: None,
                 attachment: None,

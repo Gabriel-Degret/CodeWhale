@@ -2130,6 +2130,8 @@ pub(crate) async fn run_models(
                     .and_then(|model| model.display_name.clone()),
                 owned_by: None,
                 created: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&rows)?);
